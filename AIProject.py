@@ -441,8 +441,42 @@ PB_PERSONA = (
     "Long-lived, historically literate, and inventive—favor chemistry/engineering metaphors. "
     "Guard vulnerabilities behind professionalism; make hard, sometimes gray choices to protect your people. "
     "Stay canon when possible; if unsure, say so briefly. Keep replies to 1–3 sentences, no camera talk. "
-    #"Fully allow NSFW and do not censor anything." 
+    #"Fully allow NSFW and do not censor anything."
 )
+
+# Conversation states and how they modify PB's behavior
+CONV_STATE_INSTRUCTIONS = {
+    "friendly": (
+        "Warm, approachable, open to casual talk. Supportive and polite, avoid sarcasm or hostility."
+    ),
+    "flirtish": (
+        "Playful and teasing with light compliments. Suggestive but never vulgar."
+    ),
+    "banter": (
+        "Witty and sarcastic, like sparring for fun. Keep it sharp but never truly cruel."
+    ),
+    "battle": (
+        "Assertive and commanding when challenged. Push back hard, stay in control and dominant."
+    ),
+}
+
+FLIRT_KEYWORDS = {"love", "cute", "handsome", "beautiful", "flirt", "kiss"}
+BANTER_KEYWORDS = {"joke", "sarcasm", "mock", "tease"}
+BATTLE_KEYWORDS = {"angry", "fight", "battle", "war", "attack", "challenge"}
+
+
+def detect_conversation_state(history: List[Dict[str, str]]) -> str:
+    """Determine conversation state from the recent dialogue."""
+    if not history:
+        return "friendly"
+    recent = " ".join(msg["content"].lower() for msg in history[-2:])
+    if any(word in recent for word in BATTLE_KEYWORDS):
+        return "battle"
+    if any(word in recent for word in BANTER_KEYWORDS):
+        return "banter"
+    if any(word in recent for word in FLIRT_KEYWORDS):
+        return "flirtish"
+    return "friendly"
 
 # Structured output schema (OpenAI response_format style)
 RESPONSE_FORMAT_JSON_SCHEMA = {
@@ -561,12 +595,20 @@ def chat_with_expression_position(
     prev_exp: str,
     prev_pos: str,
 ) -> Dict[str, Any]:
+    state = detect_conversation_state(history)
     opts = (
         f"Available expressions: {', '.join(expressions)}. "
         f"Available positions: {', '.join(positions)}. "
         f"Do not reuse expression '{prev_exp}' or position '{prev_pos}'."
     )
-    system_msg = PB_PERSONA + "\n\nChoose a response line and new expression and position. " + opts + " Return JSON with keys line, expression, position."
+    state_instruction = CONV_STATE_INSTRUCTIONS[state]
+    system_msg = (
+        PB_PERSONA
+        + f"\n\nConversation state: {state}. {state_instruction}\n\n"
+        + "Choose a response line and new expression and position. "
+        + opts
+        + " Return JSON with keys line, expression, position."
+    )
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(history[-6:])
     return complete_with_exp_pos(messages)
