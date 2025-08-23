@@ -86,7 +86,10 @@ def categorize_tags_with_ai(tags: List[str]) -> Dict[str, List[str]]:
         + ", ".join(CATEGORY_KEYS)
         + ". Use 'unknown' for tags you cannot place."
     )
-    for chunk in chunked(tags, 30):
+    chunks = chunked(tags, 30)
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        print(f"[LoRA] Categorizing tag chunk {idx}/{total}...")
         try:
             res = client.chat.completions.create(
                 model=MODEL,
@@ -108,25 +111,31 @@ def categorize_tags_with_ai(tags: List[str]) -> Dict[str, List[str]]:
                 if isinstance(data.get(key), list):
                     categorized[key].extend(data[key])
         except Exception as e:
-            print(f"Warning: AI categorization failed on chunk {chunk}: {e}")
+            print(f"[LoRA] Warning: AI categorization failed on chunk {idx}: {e}")
     return categorized
 
 
 def ensure_bubblegum_tags_file() -> None:
     """Create the Bubblegum tag categorization file once."""
+    print(f"[LoRA] Ensuring tag file at {BUBBLEGUM_JSON_PATH}")
     if os.path.exists(BUBBLEGUM_JSON_PATH):
+        print("[LoRA] Tag file already exists; skipping categorization.")
         return
     try:
+        print(f"[LoRA] Loading registry from {LORA_REGISTRY_PATH}")
         with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
             registry = json.load(f)
         tags = registry.get(BUBBLEGUM_LORA_NAME, {}).get("tags", [])
+        print(f"[LoRA] Found {len(tags)} tags for {BUBBLEGUM_LORA_NAME}")
         if not tags:
+            print("[LoRA] No tags found; skipping file creation.")
             return
         categorized = categorize_tags_with_ai(tags)
         with open(BUBBLEGUM_JSON_PATH, "w", encoding="utf-8") as out:
             json.dump(categorized, out, indent=2)
+        print(f"[LoRA] Wrote categorized tags to {BUBBLEGUM_JSON_PATH}")
     except Exception as e:
-        print(f"Warning: could not create Bubblegum tag file: {e}")
+        print(f"[LoRA] Warning: could not create Bubblegum tag file: {e}")
 
 
 # ---------- persona card (compact) ----------
