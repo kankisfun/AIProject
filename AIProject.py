@@ -699,6 +699,20 @@ def choose_expression_position(
 # ensure tag counts obey global rules
 def enforce_tag_rules(choice: Dict[str, Any], catalog: Dict[str, List[str]]) -> None:
     """Enforce dynamic tag constraints on the current choice."""
+    # restrict all tags to those defined in the catalog
+    for key in list(choice.keys()):
+        allowed = catalog.get(key, [])
+        val = choice[key]
+        if isinstance(val, list):
+            filtered = [t for t in val if t in allowed]
+            if filtered:
+                choice[key] = filtered
+            else:
+                choice.pop(key, None)
+        else:
+            if val not in allowed:
+                choice.pop(key, None)
+
     # two hairstyle tags
     hair = choice.get("hairstyle_hat_head_toppings", [])
     if not isinstance(hair, list):
@@ -821,6 +835,8 @@ class ChatWindow:
             else:
                 self.choice.pop(key, None)
         enforce_tag_rules(self.choice, self.catalog)
+        self.current_exp = self.choice.get("expressions", self.current_exp)
+        self.current_pos = self.choice.get("position_sex_position", self.current_pos)
         img_path = assemble_and_send_prompt(self.choice)
         if img_path:
             self.show_image(img_path)
@@ -846,6 +862,7 @@ def main() -> None:
     choice = choose_initial_tags(augmented)
     if not choice:
         sys.exit(1)
+    enforce_tag_rules(choice, augmented)
     img_path = assemble_and_send_prompt(choice)
     ChatWindow(img_path, choice, expressions, positions, augmented).run()
 
