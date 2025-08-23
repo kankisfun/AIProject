@@ -125,7 +125,12 @@ def ensure_bubblegum_tags_file() -> None:
         print(f"[LoRA] Loading registry from {LORA_REGISTRY_PATH}")
         with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
             registry = json.load(f)
-        tags = registry.get(BUBBLEGUM_LORA_NAME, {}).get("tags", [])
+        # Some registry formats nest entries under a top-level "loras" key.
+        if isinstance(registry, dict):
+            loras = registry.get("loras", registry)
+        else:
+            loras = {}
+        tags = loras.get(BUBBLEGUM_LORA_NAME, {}).get("tags", [])
         print(f"[LoRA] Found {len(tags)} tags for {BUBBLEGUM_LORA_NAME}")
         if not tags:
             print("[LoRA] No tags found; skipping file creation.")
