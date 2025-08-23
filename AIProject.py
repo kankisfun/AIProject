@@ -18,8 +18,10 @@ Docs used:
 import os
 import json
 import re
+from pathlib import Path
 from typing import Dict, Any, List
 
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -47,6 +49,14 @@ LORA_REGISTRY_PATH = os.path.normpath(
 BUBBLEGUM_LORA_NAME = "Bubblegum_ILL.safetensors"
 BUBBLEGUM_JSON_PATH = os.path.join(
     os.path.dirname(LORA_REGISTRY_PATH), "Bubblegum_ILL.json"
+)
+
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+BASE_POSITIVE = "high quality, 1girl, sexy"
+BASE_NEGATIVE = (
+    "low quality, jpeg artifacts, deformed, extra fingers, text, watermark, logo, censored"
 )
 
 CATEGORY_KEYS = [
@@ -136,6 +146,143 @@ def ensure_bubblegum_tags_file() -> None:
         print(f"[LoRA] Warning: could not create Bubblegum tag file: {e}")
 
 
+def sanitize(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
+
+
+def next_run_number(images_dir: Path, prefix: str) -> int:
+    pattern = re.compile(rf"{re.escape(prefix)}__run(\d+)")
+    max_n = -1
+    for p in images_dir.glob(f"{prefix}__run*"):
+        m = pattern.search(p.stem)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+
+def assemble_and_send_prompt() -> None:
+    """Pick tags via AI, build a ComfyUI workflow, and POST it."""
+    try:
+        with open(BUBBLEGUM_JSON_PATH, "r", encoding="utf-8") as f:
+            categorized = json.load(f)
+    except Exception as e:
+        print(f"[Prompt] Could not load categorized tags: {e}")
+        return
+
+    system_msg = (
+        "You build outfit prompts for an image generator. "
+        "From the provided options choose: 2 hairstyle tags, 1 expression, "
+        "1 fullbody outfit OR 1 top and 1 bottom, 1 accessory, 1 specific body part, "
+        "1 skin type, 1 position, and 1 background. Include an 'explanation' field."
+    )
+    user_msg = "Options:\n" + json.dumps(
+        {
+            "hairstyle_hat_head_toppings": categorized.get(
+                "hairstyle_hat_head_toppings", []
+            ),
+            "expressions": categorized.get("expressions", []),
+            "fullbody_clothes": categorized.get("fullbody_clothes", []),
+            "up_clothes": categorized.get("up_clothes", []),
+            "bottom_clothes": categorized.get("bottom_clothes", []),
+            "accessories": categorized.get("accessories", []),
+            "specific_body_parts": categorized.get("specific_body_parts", []),
+            "skin_fur": categorized.get("skin_fur", []),
+            "position_sex_position": categorized.get("position_sex_position", []),
+            "background": categorized.get("background", []),
+        }
+    )
+    try:
+        res = client.chat.completions.create(
+            model=MODEL,
+            temperature=1,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+        )
+        choice = json.loads(res.choices[0].message.content)
+    except Exception as e:
+        print(f"[Prompt] AI tag selection failed: {e}")
+        return
+
+    if expl := choice.get("explanation"):
+        print(f"[Prompt] {expl}")
+
+    selected_tags: List[str] = []
+    selected_tags.extend(choice.get("hairstyle_hat_head_toppings", [])[:2])
+    if exp := choice.get("expressions"):
+        selected_tags.append(exp)
+    if choice.get("fullbody_clothes"):
+        selected_tags.append(choice["fullbody_clothes"])
+    else:
+        if top := choice.get("up_clothes"):
+            selected_tags.append(top)
+        if bottom := choice.get("bottom_clothes"):
+            selected_tags.append(bottom)
+    for key in [
+        "accessories",
+        "specific_body_parts",
+        "skin_fur",
+        "position_sex_position",
+        "background",
+    ]:
+        val = choice.get(key)
+        if val:
+            selected_tags.append(val)
+
+    try:
+        with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+        loras = registry.get("loras", registry)
+        entry = loras.get(BUBBLEGUM_LORA_NAME, {})
+    except Exception:
+        entry = {}
+    lora_path = entry.get("path", BUBBLEGUM_LORA_NAME).replace("\\", "/")
+    trigger = entry.get("trigger", "") or entry.get("trigger_words", "")
+    token = trigger.split()[0] if trigger else os.path.splitext(BUBBLEGUM_LORA_NAME)[0]
+
+    base_pos = BASE_POSITIVE
+    if trigger:
+        base_pos += ", " + trigger
+    positive_text = base_pos + ", " + ", ".join(selected_tags)
+
+    try:
+        with open("1lora.json", "r", encoding="utf-8") as f:
+            workflow = json.load(f)
+    except Exception as e:
+        print(f"[Prompt] Could not load workflow template: {e}")
+        return
+
+    workflow.get("6", {}).setdefault("inputs", {})["text"] = positive_text
+    workflow.get("7", {}).setdefault("inputs", {})["text"] = BASE_NEGATIVE
+    lora_inputs = workflow.get("10", {}).setdefault("inputs", {})
+    lora_inputs["lora_name"] = lora_path
+    lora_inputs["strength_model"] = 0.75
+    lora_inputs["strength_clip"] = 0.75
+    workflow.get("3", {}).setdefault("inputs", {})["seed"] = 504
+    workflow.get("4", {}).setdefault("inputs", {})["ckpt_name"] = (
+        "waiNSFWIllustrious_v120.safetensors"
+    )
+    workflow.get("12", {}).setdefault("inputs", {})["model_name"] = (
+        "RealESRGAN_x4plus.pth"
+    )
+
+    short_slug = "__".join(sanitize(t) for t in selected_tags[:3])
+    prefix_base = f"{sanitize(token)}__{short_slug}"
+    n = next_run_number(IMAGES_DIR, prefix_base)
+    filename_prefix = f"{IMAGES_DIR.name}/{prefix_base}__run{n}"
+    workflow.get("9", {}).setdefault("inputs", {})["filename_prefix"] = filename_prefix
+
+    try:
+        r = requests.post(
+            "http://127.0.0.1:8188/prompt", json={"prompt": workflow}, timeout=10
+        )
+        print(f"[ComfyUI] POST status {r.status_code}")
+    except Exception as e:
+        print(f"[ComfyUI] Warning: {e}")
+
+
 # ---------- persona card (compact) ----------
 
 # Your longer description, distilled to stay cheap in tokens but true to the vibe.
@@ -222,6 +369,10 @@ def chat_once(user_text: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     ensure_bubblegum_tags_file()
+    try:
+        assemble_and_send_prompt()
+    except Exception as e:
+        print(f"[ComfyUI] Prompt assembly failed: {e}")
     print("💬 Chatting with Princess Bubblegum. Press Ctrl+C to quit.")
     print("Tip: Ask things like 'How was court today?' or 'Propose a science date idea.'\n")
     try:
