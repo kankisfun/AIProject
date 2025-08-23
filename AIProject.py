@@ -605,6 +605,16 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
     )
     user_msg = json.dumps({"player": last_user, "assistant": last_assistant})
     messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    allowed = {
+        "hairstyle_hat_head_toppings",
+        "fullbody_clothes",
+        "up_clothes",
+        "bottom_clothes",
+        "accessories",
+        "specific_body_parts",
+        "skin_fur",
+        "background",
+    }
     schema = {
         "type": "json_schema",
         "json_schema": {
@@ -614,7 +624,10 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
                 "properties": {
                     "categories": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(list(allowed)),
+                        },
                     }
                 },
                 "required": ["categories"],
@@ -624,19 +637,23 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
     }
     try:
         res = client.chat.completions.create(
-            model=MODEL, messages=messages, temperature=0.7, response_format=schema
+            model=MODEL, messages=messages, temperature=0, response_format=schema
         )
     except Exception:
         res = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            temperature=0.7,
+            temperature=0,
             response_format={"type": "json_object"},
         )
     msg = res.choices[0].message
     print("[AI Response]", msg.content)
-    cats = safe_json_loads(msg.content).get("categories", [])
-    return [c for c in cats if c and c.lower() != "nothing"]
+    cats = [c for c in safe_json_loads(msg.content).get("categories", []) if c]
+    filtered = [c for c in cats if c in allowed and c.lower() != "nothing"]
+    dropped = [c for c in cats if c not in allowed]
+    if dropped:
+        print(f"[CatDecider] Dropping unknown categories: {dropped}")
+    return filtered
 
 
 def choose_expression_position(
@@ -670,31 +687,51 @@ def choose_expression_position(
         system_msg += " Return JSON with keys expression, position."
     current: Dict[str, Any] = {}
     available: Dict[str, Any] = {}
-    clothing_set = {
-        "fullbody_clothes",
-        "up_clothes",
-        "bottom_clothes",
-        "accessories",
-    }
-    if any(cat in categories for cat in clothing_set):
-        for cat in clothing_set:
-            current[cat] = choice.get(cat)
-            available[cat] = catalog.get(cat, [])
     for cat in categories:
-        if cat in clothing_set:
-            continue
         current[cat] = (
             choice.get(cat, []) if cat == "hairstyle_hat_head_toppings" else choice.get(cat)
         )
         available[cat] = catalog.get(cat, [])
-    user_msg = json.dumps(
-        {
-            "available_expressions": avail_exps,
-            "available_positions": avail_pos,
-            "current_tags": current,
-            "available_tags": available,
-        }
-    )
+    payload = {
+        "categories_to_update": categories,
+        "available_expressions": avail_exps,
+        "available_positions": avail_pos,
+        "available_tags": {k: available[k] for k in categories},
+        "current_tags": {k: current[k] for k in categories},
+        "prev_expression": prev_exp,
+        "prev_position": prev_pos,
+    }
+    user_msg = json.dumps(payload)
+    properties: Dict[str, Any] = {
+        "expression": {"type": "string", "enum": avail_exps},
+        "position": {"type": "string", "enum": avail_pos},
+    }
+    for cat in categories:
+        tags = available.get(cat, [])
+        if not tags:
+            continue
+        if cat == "hairstyle_hat_head_toppings":
+            properties[cat] = {
+                "type": "array",
+                "items": {"type": "string", "enum": tags},
+                "minItems": 2,
+                "maxItems": 2,
+                "uniqueItems": True,
+            }
+        else:
+            properties[cat] = {"type": "string", "enum": tags}
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "TagSwapper",
+            "schema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["expression", "position"],
+                "additionalProperties": False,
+            },
+        },
+    }
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(history[-6:])
     messages.append({"role": "user", "content": user_msg})
@@ -702,8 +739,8 @@ def choose_expression_position(
         res = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            temperature=0.7,
-            response_format={"type": "json_object"},
+            temperature=0,
+            response_format=schema,
         )
     except Exception as e:
         print(f"[ExpPos] Warning: {e}")
@@ -720,22 +757,30 @@ def choose_expression_position(
     data["expression"] = exp
     data["position"] = pos
 
-    # filter any returned tags to the allowed sets for each category
+    allowed_keys = {"expression", "position"} | set(categories)
     for key in list(data.keys()):
+        if key not in allowed_keys:
+            print(f"[TagSwapper] Dropping unexpected key: {key}")
+            data.pop(key, None)
+            continue
         if key in {"expression", "position"}:
             continue
         opts = available.get(key, [])
         val = data.get(key)
-        if isinstance(val, list):
+        if key == "hairstyle_hat_head_toppings":
+            if not isinstance(val, list):
+                val = [val] if val else []
             vals = [v for v in val if v in opts]
-            if vals:
-                data[key] = vals
-            else:
+            vals = list(dict.fromkeys(vals))
+            if len(vals) != 2:
+                print(f"[TagSwapper] Invalid hairstyle tags: {val}")
                 data.pop(key, None)
+            else:
+                data[key] = vals[:2]
         else:
             if val not in opts:
+                print(f"[TagSwapper] Invalid tag for {key}: {val}")
                 data.pop(key, None)
-
     return data
 
 
