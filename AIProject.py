@@ -170,21 +170,24 @@ def categorize_tags_with_ai(tags: List[str]) -> Dict[str, List[str]]:
     for idx, chunk in enumerate(chunks, start=1):
         print(f"[LoRA] Categorizing tag chunk {idx}/{total}...")
         try:
+            messages = [
+                {"role": "system", "content": system_msg},
+                {
+                    "role": "user",
+                    "content": (
+                        "Categorize these tags into the categories. Reply with JSON only.\nTags: "
+                        + json.dumps(chunk)
+                    ),
+                },
+            ]
+            print("[AI Request]", json.dumps(messages, indent=2))
             res = client.chat.completions.create(
                 model=MODEL,
                 temperature=0,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Categorize these tags into the categories. Reply with JSON only.\nTags: "
-                            + json.dumps(chunk)
-                        ),
-                    },
-                ],
+                messages=messages,
                 response_format={"type": "json_object"},
             )
+            print("[AI Response]", res.choices[0].message.content)
             data = json.loads(res.choices[0].message.content)
             for key in CATEGORY_KEYS:
                 if isinstance(data.get(key), list):
@@ -289,15 +292,18 @@ def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
         }
     )
     try:
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+        print("[AI Request]", json.dumps(messages, indent=2))
         res = client.chat.completions.create(
             model=MODEL,
             temperature=1,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
+            messages=messages,
             response_format={"type": "json_object"},
         )
+        print("[AI Response]", res.choices[0].message.content)
         choice = json.loads(res.choices[0].message.content)
     except Exception as e:
         print(f"[Prompt] AI tag selection failed: {e}")
@@ -387,11 +393,14 @@ def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
 
     existing = set(WATCH_DIR.glob(f"{expected_prefix}*.png"))
 
+    payload = {"prompt": workflow}
+    print("[ComfyUI] Workflow payload:", json.dumps(payload, indent=2))
     try:
         r = requests.post(
-            "http://127.0.0.1:8188/prompt", json={"prompt": workflow}, timeout=10
+            "http://127.0.0.1:8188/prompt", json=payload, timeout=10
         )
         print(f"[ComfyUI] POST status {r.status_code}")
+        print(f"[ComfyUI] Response body: {r.text}")
     except Exception as e:
         print(f"[ComfyUI] Warning: {e}")
         return None
@@ -475,6 +484,7 @@ def safe_json_loads(maybe_json: str) -> Dict[str, Any]:
 
 def complete(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     """One full turn returning structured JSON."""
+    print("[AI Request]", json.dumps(messages, indent=2))
     try:
         res = client.chat.completions.create(
             model=MODEL,
@@ -491,6 +501,7 @@ def complete(messages: List[Dict[str, str]]) -> Dict[str, Any]:
         )
 
     msg = res.choices[0].message
+    print("[AI Response]", msg.content)
 
     # Parse final JSON payload
     return safe_json_loads(msg.content)
@@ -498,6 +509,7 @@ def complete(messages: List[Dict[str, str]]) -> Dict[str, Any]:
 
 def complete_with_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     """Chat completion that returns line, expression, and position."""
+    print("[AI Request]", json.dumps(messages, indent=2))
     schema = {
         "type": "json_schema",
         "json_schema": {
@@ -530,6 +542,7 @@ def complete_with_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
             response_format={"type": "json_object"},
         )
     msg = res.choices[0].message
+    print("[AI Response]", msg.content)
     return safe_json_loads(msg.content)
 
 
