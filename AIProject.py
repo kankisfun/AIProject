@@ -43,6 +43,92 @@ if not TOGETHER_API_KEY:
 
 client = OpenAI(api_key=TOGETHER_API_KEY, base_url=BASE_URL)
 
+# ---------- lora tag categorization ----------
+
+LORA_REGISTRY_PATH = os.path.normpath(
+    os.getenv(
+        "LORA_REGISTRY_PATH",
+        r"E:\\ConfyUI_New\\ComfyUI\\models\\loras\\lora_registry.json",
+    )
+)
+BUBBLEGUM_LORA_NAME = "Bubblegum_ILL.safetensors"
+BUBBLEGUM_JSON_PATH = os.path.join(
+    os.path.dirname(LORA_REGISTRY_PATH), "Bubblegum_ILL.json"
+)
+
+CATEGORY_KEYS = [
+    "hairstyle_hat_head_toppings",
+    "expressions",
+    "fullbody_clothes",
+    "up_clothes",
+    "bottom_clothes",
+    "accessories",
+    "specific_body_parts",
+    "skin_fur",
+    "position_sex_position",
+    "camera_framing",
+    "background",
+    "other",
+    "unknown",
+]
+
+
+def chunked(seq: List[Any], size: int) -> List[List[Any]]:
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def categorize_tags_with_ai(tags: List[str]) -> Dict[str, List[str]]:
+    """Use the chat model to bucket tags into preset categories."""
+    categorized = {k: [] for k in CATEGORY_KEYS}
+    system_msg = (
+        "You sort character description tags into predefined categories. "
+        "Return JSON with keys exactly: "
+        + ", ".join(CATEGORY_KEYS)
+        + ". Use 'unknown' for tags you cannot place."
+    )
+    for chunk in chunked(tags, 30):
+        try:
+            res = client.chat.completions.create(
+                model=MODEL,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Categorize these tags into the categories. Reply with JSON only.\nTags: "
+                            + json.dumps(chunk)
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(res.choices[0].message.content)
+            for key in CATEGORY_KEYS:
+                if isinstance(data.get(key), list):
+                    categorized[key].extend(data[key])
+        except Exception as e:
+            print(f"Warning: AI categorization failed on chunk {chunk}: {e}")
+    return categorized
+
+
+def ensure_bubblegum_tags_file() -> None:
+    """Create the Bubblegum tag categorization file once."""
+    if os.path.exists(BUBBLEGUM_JSON_PATH):
+        return
+    try:
+        with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+        tags = registry.get(BUBBLEGUM_LORA_NAME, {}).get("tags", [])
+        if not tags:
+            return
+        categorized = categorize_tags_with_ai(tags)
+        with open(BUBBLEGUM_JSON_PATH, "w", encoding="utf-8") as out:
+            json.dump(categorized, out, indent=2)
+    except Exception as e:
+        print(f"Warning: could not create Bubblegum tag file: {e}")
+
+
 # ---------- persona card (compact) ----------
 
 # Your longer description, distilled to stay cheap in tokens but true to the vibe.
@@ -334,6 +420,7 @@ def chat_once(user_text: str) -> Dict[str, Any]:
 # ---------- demo REPL ----------
 
 if __name__ == "__main__":
+    ensure_bubblegum_tags_file()
     print("💬 Chatting with Princess Bubblegum. Press Ctrl+C to quit.")
     print("Tip: Ask things like 'How was court today?' or 'Propose a science date idea.'\n")
     try:
