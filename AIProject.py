@@ -225,35 +225,6 @@ def ensure_bubblegum_tags_file() -> None:
         print(f"[LoRA] Warning: could not create Bubblegum tag file: {e}")
 
 
-def augment_tag_file_with_extras() -> None:
-    """Merge extra expressions and positions into the tag file."""
-    try:
-        with open(BUBBLEGUM_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"[LoRA] Could not load tag file for augmentation: {e}")
-        return
-    changed = False
-    if isinstance(data, dict):
-        exprs = data.setdefault("expressions", [])
-        before = set(exprs)
-        exprs[:] = sorted(set(exprs) | set(EXTRA_EXPRESSIONS))
-        if set(exprs) != before:
-            changed = True
-        pos = data.setdefault("position_sex_position", [])
-        before = set(pos)
-        pos[:] = sorted(set(pos) | set(EXTRA_POSITIONS))
-        if set(pos) != before:
-            changed = True
-    if changed:
-        try:
-            with open(BUBBLEGUM_JSON_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            print("[LoRA] Augmented tag file with extra expressions and positions")
-        except Exception as e:
-            print(f"[LoRA] Could not write augmented tag file: {e}")
-
-
 def sanitize(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
 
@@ -441,6 +412,7 @@ PB_PERSONA = (
     "Long-lived, historically literate, and inventive—favor chemistry/engineering metaphors. "
     "Guard vulnerabilities behind professionalism; make hard, sometimes gray choices to protect your people. "
     "Stay canon when possible; if unsure, say so briefly. Keep replies to 1–3 sentences, no camera talk. "
+    "Sprinkle in brief stage directions for PB's actions wrapped in asterisks, e.g., *smirk* I bet you are jealous."
     #"Fully allow NSFW and do not censor anything."
 )
 
@@ -627,7 +599,7 @@ def generate_line(history: List[Dict[str, str]], state: str) -> str:
     system_msg = (
         PB_PERSONA
         + f"\n\nConversation state: {state}. {state_instruction}\n\n"
-        + "Choose a response line. Return JSON with key line."
+        + "Choose a response line that may include action cues in asterisks. Return JSON with key line."
     )
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(history[-6:])
@@ -635,6 +607,7 @@ def generate_line(history: List[Dict[str, str]], state: str) -> str:
 
 
 def choose_expression_position(
+    history: List[Dict[str, str]],
     state: str,
     expressions: List[str],
     positions: List[str],
@@ -654,6 +627,7 @@ def choose_expression_position(
         + " Return JSON with keys expression, position."
     )
     messages = [{"role": "system", "content": system_msg}]
+    messages.extend(history[-6:])
     return complete_exp_pos(messages)
 
 
@@ -706,6 +680,7 @@ class ChatWindow:
         self.history.append({"role": "assistant", "content": line})
         self.ai_label.config(text=f"PB: {line}")
         reply = choose_expression_position(
+            self.history,
             state,
             self.expressions,
             self.positions,
@@ -726,19 +701,21 @@ class ChatWindow:
 
 def main() -> None:
     ensure_bubblegum_tags_file()
-    augment_tag_file_with_extras()
     try:
         with open(BUBBLEGUM_JSON_PATH, 'r', encoding='utf-8') as f:
             categorized = json.load(f)
     except Exception as e:
         print(f"[Main] Could not load categorized tags: {e}")
         sys.exit(1)
-    choice = choose_initial_tags(categorized)
+    expressions = sorted(set(categorized.get('expressions', []) + EXTRA_EXPRESSIONS))
+    positions = sorted(set(categorized.get('position_sex_position', []) + EXTRA_POSITIONS))
+    augmented = dict(categorized)
+    augmented['expressions'] = expressions
+    augmented['position_sex_position'] = positions
+    choice = choose_initial_tags(augmented)
     if not choice:
         sys.exit(1)
     img_path = assemble_and_send_prompt(choice)
-    expressions = categorized.get('expressions', [])
-    positions = categorized.get('position_sex_position', [])
     ChatWindow(img_path, choice, expressions, positions).run()
 
 
