@@ -173,7 +173,8 @@ def assemble_and_send_prompt() -> None:
         "You build outfit prompts for an image generator. "
         "From the provided options choose: 2 hairstyle tags, 1 expression, "
         "1 fullbody outfit OR 1 top and 1 bottom, 1 accessory, 1 specific body part, "
-        "1 skin type, 1 position, and 1 background. Include an 'explanation' field."
+        "1 skin type, 1 position, and 1 background. "
+        "Return JSON with only the selected tags in their respective fields; no extra text."
     )
     user_msg = "Options:\n" + json.dumps(
         {
@@ -206,9 +207,6 @@ def assemble_and_send_prompt() -> None:
         print(f"[Prompt] AI tag selection failed: {e}")
         return
 
-    if expl := choice.get("explanation"):
-        print(f"[Prompt] {expl}")
-
     selected_tags: List[str] = []
     selected_tags.extend(choice.get("hairstyle_hat_head_toppings", [])[:2])
     if exp := choice.get("expressions"):
@@ -231,6 +229,8 @@ def assemble_and_send_prompt() -> None:
         if val:
             selected_tags.append(val)
 
+    print(f"[Prompt] {json.dumps(selected_tags)}")
+
     try:
         with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
             registry = json.load(f)
@@ -240,12 +240,17 @@ def assemble_and_send_prompt() -> None:
         entry = {}
     lora_path = entry.get("path", BUBBLEGUM_LORA_NAME).replace("\\", "/")
     trigger = entry.get("trigger", "") or entry.get("trigger_words", "")
-    token = trigger.split()[0] if trigger else os.path.splitext(BUBBLEGUM_LORA_NAME)[0]
+    if isinstance(trigger, list):
+        trigger_text = " ".join(trigger)
+    else:
+        trigger_text = str(trigger)
+    token = trigger_text.split()[0] if trigger_text else os.path.splitext(BUBBLEGUM_LORA_NAME)[0]
 
     base_pos = BASE_POSITIVE
-    if trigger:
-        base_pos += ", " + trigger
+    if trigger_text:
+        base_pos += ", " + trigger_text
     positive_text = base_pos + ", " + ", ".join(selected_tags)
+    print(f"[Prompt] Positive prompt: {positive_text}")
 
     try:
         with open("1lora.json", "r", encoding="utf-8") as f:
