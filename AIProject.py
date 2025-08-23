@@ -20,8 +20,9 @@ import json
 import re
 import sys
 import time
+import random
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import tkinter as tk
 from PIL import Image, ImageTk
@@ -79,7 +80,6 @@ CATEGORY_KEYS = [
     "specific_body_parts",
     "skin_fur",
     "position_sex_position",
-    "camera_framing",
     "background",
     "other",
     "unknown",
@@ -606,6 +606,67 @@ def generate_line(history: List[Dict[str, str]], state: str) -> str:
     return complete(messages).get("line", "")
 
 
+def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
+    """Determine which tag categories need changing based on last turn."""
+    if len(history) < 2:
+        return []
+    last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+    last_assistant = next(
+        (m["content"] for m in reversed(history) if m["role"] == "assistant"), ""
+    )
+    system_msg = (
+        "You analyze the last player message and the last assistant message. "
+        "Decide which of these categories should update tags: "
+        "hairstyle_hat_head_toppings, fullbody_clothes, up_clothes, bottom_clothes, "
+        "accessories, specific_body_parts, skin_fur, background. "
+        "Examples: hairstyle_hat_head_toppings – hair changes or adding/removing "
+        "hat/tiara/crown/glasses. fullbody_clothes/up_clothes/bottom_clothes – "
+        "putting on or removing clothes or changing outfit type (e.g., dress → "
+        "swimsuit). accessories – picking up or dropping accessories like "
+        "clipboards, backpacks, heels, gloves, or equipping/removing footwear. "
+        "specific_body_parts – exposing or covering body parts (cleavage, armpits, "
+        "midriff) or emphasizing changes (showing thighs, flexing). skin_fur – skin "
+        "color changes or transforming into non-human forms (slime girl, monster "
+        "girl). background – moving location (indoors → outdoors) or weather/setting "
+        "changes (rain, night, pool, fire). Return JSON with key 'categories' as a "
+        "list. Use ['Nothing'] if no change."
+    )
+    user_msg = json.dumps({"player": last_user, "assistant": last_assistant})
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "CategoryDecider",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    }
+                },
+                "required": ["categories"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    try:
+        res = client.chat.completions.create(
+            model=MODEL, messages=messages, temperature=0.7, response_format=schema
+        )
+    except Exception:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+    msg = res.choices[0].message
+    print("[AI Response]", msg.content)
+    cats = safe_json_loads(msg.content).get("categories", [])
+    return [c for c in cats if c and c.lower() != "nothing"]
+
+
 def choose_expression_position(
     history: List[Dict[str, str]],
     state: str,
@@ -613,32 +674,143 @@ def choose_expression_position(
     positions: List[str],
     prev_exp: str,
     prev_pos: str,
-) -> Dict[str, str]:
-    avail_exps = [e for e in expressions if e != prev_exp]
-    avail_pos = [p for p in positions if p != prev_pos]
-    opts = (
-        f"Available expressions: {', '.join(avail_exps)}. "
-        f"Available positions: {', '.join(avail_pos)}."
-    )
+    categories: Optional[List[str]] = None,
+    choice: Optional[Dict[str, Any]] = None,
+    catalog: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
+    categories = categories or []
+    choice = choice or {}
+    catalog = catalog or {}
+    avail_exps = [e for e in expressions if e != prev_exp] or expressions
+    avail_pos = [p for p in positions if p != prev_pos] or positions
     system_msg = (
         PB_PERSONA
-        + f"\n\nConversation state: {state}. Choose new expression and position. "
-        + opts
-        + " Return JSON with keys expression, position."
+        + f"\n\nConversation state: {state}. Choose a new expression and a new position different from the previous ones."
+    )
+    if categories:
+        system_msg += (
+            " Also update these categories if needed: "
+            + ", ".join(categories)
+            + ". Follow rules: always return two hairstyle tags; choose either one fullbody outfit or one top and one bottom; accessories only when no fullbody outfit; specific_body_parts, skin_fur, background require exactly one tag each."
+            " Return JSON with keys expression, position and any updated categories."
+        )
+    else:
+        system_msg += " Return JSON with keys expression, position."
+    current: Dict[str, Any] = {}
+    available: Dict[str, Any] = {}
+    clothing_set = {
+        "fullbody_clothes",
+        "up_clothes",
+        "bottom_clothes",
+        "accessories",
+    }
+    if any(cat in categories for cat in clothing_set):
+        for cat in clothing_set:
+            current[cat] = choice.get(cat)
+            available[cat] = catalog.get(cat, [])
+    for cat in categories:
+        if cat in clothing_set:
+            continue
+        current[cat] = (
+            choice.get(cat, []) if cat == "hairstyle_hat_head_toppings" else choice.get(cat)
+        )
+        available[cat] = catalog.get(cat, [])
+    user_msg = json.dumps(
+        {
+            "available_expressions": avail_exps,
+            "available_positions": avail_pos,
+            "current_tags": current,
+            "available_tags": available,
+        }
     )
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(history[-6:])
-    return complete_exp_pos(messages)
+    messages.append({"role": "user", "content": user_msg})
+    try:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        print(f"[ExpPos] Warning: {e}")
+        return {}
+    msg = res.choices[0].message
+    print("[AI Response]", msg.content)
+    data = safe_json_loads(msg.content)
+    exp = data.get("expression")
+    if exp not in avail_exps:
+        exp = random.choice(avail_exps)
+    pos = data.get("position")
+    if pos not in avail_pos:
+        pos = random.choice(avail_pos)
+    data["expression"] = exp
+    data["position"] = pos
+    return data
 
 
+# ensure tag counts obey global rules
+def enforce_tag_rules(choice: Dict[str, Any], catalog: Dict[str, List[str]]) -> None:
+    """Enforce dynamic tag constraints on the current choice."""
+    # two hairstyle tags
+    hair = choice.get("hairstyle_hat_head_toppings", [])
+    if not isinstance(hair, list):
+        hair = [hair] if hair else []
+    hair = [t for t in hair if t]
+    available_hair = [
+        t for t in catalog.get("hairstyle_hat_head_toppings", []) if t not in hair
+    ]
+    while len(hair) < 2 and available_hair:
+        tag = random.choice(available_hair)
+        hair.append(tag)
+        available_hair.remove(tag)
+    choice["hairstyle_hat_head_toppings"] = hair[:2]
+
+    # outfit rules
+    if choice.get("fullbody_clothes"):
+        choice.pop("up_clothes", None)
+        choice.pop("bottom_clothes", None)
+        choice.pop("accessories", None)
+    else:
+        if not choice.get("up_clothes"):
+            tops = catalog.get("up_clothes", [])
+            if tops:
+                choice["up_clothes"] = random.choice(tops)
+        if not choice.get("bottom_clothes"):
+            bottoms = catalog.get("bottom_clothes", [])
+            if bottoms:
+                choice["bottom_clothes"] = random.choice(bottoms)
+        acc = choice.get("accessories")
+        if isinstance(acc, list):
+            choice["accessories"] = acc[0] if acc else None
+
+    # ensure single tags for mandatory categories
+    for key in ["specific_body_parts", "skin_fur", "background"]:
+        val = choice.get(key)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if not val:
+            options = catalog.get(key, [])
+            if options:
+                val = random.choice(options)
+        choice[key] = val
 
 # ---------- simple GUI ----------
 
 class ChatWindow:
-    def __init__(self, initial_image: Path, choice: Dict[str, Any], expressions: List[str], positions: List[str]):
+    def __init__(
+        self,
+        initial_image: Path,
+        choice: Dict[str, Any],
+        expressions: List[str],
+        positions: List[str],
+        catalog: Dict[str, List[str]],
+    ):
         self.choice = choice
         self.expressions = expressions
         self.positions = positions
+        self.catalog = catalog
         self.history: List[Dict[str, str]] = []
         self.current_exp = choice.get("expressions", "")
         self.current_pos = choice.get("position_sex_position", "")
@@ -679,6 +851,7 @@ class ChatWindow:
         line = generate_line(self.history, state)
         self.history.append({"role": "assistant", "content": line})
         self.ai_label.config(text=f"PB: {line}")
+        categories = decide_tag_categories(self.history)
         reply = choose_expression_position(
             self.history,
             state,
@@ -686,11 +859,22 @@ class ChatWindow:
             self.positions,
             self.current_exp,
             self.current_pos,
+            categories,
+            self.choice,
+            self.catalog,
         )
         self.current_exp = reply.get("expression", self.current_exp)
         self.current_pos = reply.get("position", self.current_pos)
         self.choice["expressions"] = self.current_exp
         self.choice["position_sex_position"] = self.current_pos
+        for key, val in reply.items():
+            if key in {"expression", "position"}:
+                continue
+            if val:
+                self.choice[key] = val
+            else:
+                self.choice.pop(key, None)
+        enforce_tag_rules(self.choice, self.catalog)
         img_path = assemble_and_send_prompt(self.choice)
         if img_path:
             self.show_image(img_path)
@@ -716,7 +900,7 @@ def main() -> None:
     if not choice:
         sys.exit(1)
     img_path = assemble_and_send_prompt(choice)
-    ChatWindow(img_path, choice, expressions, positions).run()
+    ChatWindow(img_path, choice, expressions, positions, augmented).run()
 
 
 if __name__ == '__main__':
