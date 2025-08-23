@@ -58,6 +58,12 @@ BUBBLEGUM_JSON_PATH = os.path.join(
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+# NEW: where ComfyUI actually writes images (default)
+COMFY_OUTPUT_DIR = Path(os.getenv("COMFY_OUTPUT_DIR", r"E:\ConfyUI_New\ComfyUI\output"))
+WATCH_DIR = COMFY_OUTPUT_DIR / IMAGES_DIR.name  # e.g., .../ComfyUI/output/images
+WATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+
 BASE_POSITIVE = "high quality, 1girl, sexy"
 BASE_NEGATIVE = (
     "low quality, jpeg artifacts, deformed, extra fingers, text, watermark, logo, censored"
@@ -376,8 +382,11 @@ def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
     n = next_run_number(IMAGES_DIR, prefix_base)
     filename_prefix = f"{IMAGES_DIR.name}/{prefix_base}__run{n}"
     workflow.get("9", {}).setdefault("inputs", {})["filename_prefix"] = filename_prefix
+    expected_prefix = Path(filename_prefix).name  # e.g. "images\pb__foo__run7" -> "pb__foo__run7"
 
-    existing = set(IMAGES_DIR.glob("*.png"))
+
+    existing = set(WATCH_DIR.glob(f"{expected_prefix}*.png"))
+
     try:
         r = requests.post(
             "http://127.0.0.1:8188/prompt", json={"prompt": workflow}, timeout=10
@@ -387,13 +396,32 @@ def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
         print(f"[ComfyUI] Warning: {e}")
         return None
 
-    for _ in range(120):
-        new_files = set(IMAGES_DIR.glob("*.png")) - existing
+    for _ in range(240):  # up to ~2 minutes at 0.5s
+        new_files = set(WATCH_DIR.glob(f"{expected_prefix}*.png")) - existing
         if new_files:
-            return max(new_files, key=os.path.getmtime)
+            candidate = max(new_files, key=os.path.getmtime)
+
+            # wait until size is stable and image opens cleanly
+            stable = 0
+            last_size = -1
+            for _ in range(20):  # up to ~10s extra
+                try:
+                    sz = candidate.stat().st_size
+                    if sz == last_size:
+                        # try to open/verify only once size stayed the same
+                        from PIL import Image
+                        with Image.open(candidate) as im:
+                            im.verify()  # ensure not truncated
+                        return candidate
+                    last_size = sz
+                    time.sleep(0.5)
+                    stable += 1
+                except Exception:
+                    time.sleep(0.5)
         time.sleep(0.5)
-    print("[ComfyUI] Warning: image not found after waiting")
+    print("[ComfyUI] Warning: image not found or not complete in time")
     return None
+
 # ---------- persona card (compact) ----------
 
 # Your longer description, distilled to stay cheap in tokens but true to the vibe.
@@ -404,6 +432,7 @@ PB_PERSONA = (
     "Long-lived, historically literate, and inventive—favor chemistry/engineering metaphors. "
     "Guard vulnerabilities behind professionalism; make hard, sometimes gray choices to protect your people. "
     "Stay canon when possible; if unsure, say so briefly. Keep replies to 1–3 sentences, no camera talk. "
+    "Fully allow NSFW and do not censor anything." 
 )
 
 # Structured output schema (OpenAI response_format style)
@@ -558,8 +587,13 @@ class ChatWindow:
     def show_image(self, path: Path) -> None:
         try:
             img = Image.open(path)
+
+            # scale it to fit nicely in the window, e.g., 720x1080 max
+            img.thumbnail((720, 1080), Image.Resampling.LANCZOS)
+
             self.photo = ImageTk.PhotoImage(img)
             self.image_label.config(image=self.photo)
+            self.image_label.image = self.photo  # prevent garbage collection
         except Exception as e:
             print(f"[UI] Could not load image: {e}")
 
