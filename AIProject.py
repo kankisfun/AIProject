@@ -225,7 +225,33 @@ def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
     except Exception as e:
         print(f"[Prompt] AI tag selection failed: {e}")
         return {}
-    return choice
+
+    # restrict all returned tags to the provided options
+    allowed = {
+        "hairstyle_hat_head_toppings": categorized.get("hairstyle_hat_head_toppings", []),
+        "expressions": categorized.get("expressions", []),
+        "fullbody_clothes": categorized.get("fullbody_clothes", []),
+        "up_clothes": categorized.get("up_clothes", []),
+        "bottom_clothes": categorized.get("bottom_clothes", []),
+        "accessories": categorized.get("accessories", []),
+        "specific_body_parts": categorized.get("specific_body_parts", []),
+        "skin_fur": categorized.get("skin_fur", []),
+        "position_sex_position": categorized.get("position_sex_position", []),
+        "background": categorized.get("background", []),
+    }
+    filtered: Dict[str, Any] = {}
+    for key, opts in allowed.items():
+        val = choice.get(key)
+        if isinstance(val, list):
+            vals = [v for v in val if v in opts]
+            if vals:
+                filtered[key] = vals
+        else:
+            if val in opts:
+                filtered[key] = val
+
+    enforce_tag_rules(filtered, categorized)
+    return filtered
 
 
 def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
@@ -693,6 +719,23 @@ def choose_expression_position(
         pos = random.choice(avail_pos)
     data["expression"] = exp
     data["position"] = pos
+
+    # filter any returned tags to the allowed sets for each category
+    for key in list(data.keys()):
+        if key in {"expression", "position"}:
+            continue
+        opts = available.get(key, [])
+        val = data.get(key)
+        if isinstance(val, list):
+            vals = [v for v in val if v in opts]
+            if vals:
+                data[key] = vals
+            else:
+                data.pop(key, None)
+        else:
+            if val not in opts:
+                data.pop(key, None)
+
     return data
 
 
