@@ -18,9 +18,13 @@ Docs used:
 import os
 import json
 import re
+import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, List
 
+import tkinter as tk
+from PIL import Image, ImageTk
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -73,6 +77,72 @@ CATEGORY_KEYS = [
     "background",
     "other",
     "unknown",
+]
+
+EXTRA_EXPRESSIONS = [
+    "Neutral face",
+    "Gentle smile",
+    "Wide open smile happy",
+    "Closed eyes smile joyful",
+    "Laughing with open mouth squinting eyes",
+    "Small frown slight sadness",
+    "Big frown serious sadness",
+    "Crying with tears streaming",
+    "Pouting with cheeks puffed",
+    "Blushing smile shy happy",
+    "Blushing looking away embarrassed",
+    "Angry with teeth showing",
+    "Angry shouting yelling",
+    "Confused head tilted raised eyebrow",
+    "Worried with sweat drop",
+    "Surprised wide eyes open mouth",
+    "Shocked pale face wide eyes",
+    "Determined sharp eyes set mouth",
+    "Smirk smug half smile",
+    "Mischievous teasing grin",
+    "Sleepy half closed eyes yawning",
+    "Serious flat expression sharp eyes",
+    "Nervous laugh awkward sweat drop",
+    "Daydreaming sparkly eyes soft smile",
+    "Scared trembling mouth wide eyes",
+    "Excited sparkling eyes wide grin",
+    "Disgusted wrinkled nose frown",
+    "Surprised blush shock with blush",
+    "Thinking hand on chin furrowed brow",
+    "Deadpan flat stare no emotion",
+]
+
+EXTRA_POSITIONS = [
+    "Standing neutral arms at sides",
+    "Standing one hand on hip",
+    "Standing arms crossed",
+    "Standing hands behind back",
+    "Standing hands in pockets",
+    "Standing arms raised victory pose",
+    "Standing arms spread welcoming",
+    "Standing leaning forward curious",
+    "Sitting normal on chair",
+    "Sitting casual slouched",
+    "Sitting cross legged",
+    "Sitting knees together hands on lap",
+    "Sitting on ground legs stretched",
+    "Kneeling basic pose",
+    "Kneeling one knee up proposing stance",
+    "Walking forward casual",
+    "Running basic pose",
+    "Jumping arms up cheerful",
+    "Jumping sideways action pose",
+    "Leaning against wall arms crossed",
+    "Leaning forward on desk",
+    "Reaching hand forward",
+    "Pointing finger outward",
+    "Peace sign V pose",
+    "Waving hand friendly",
+    "Hands clasped in front shy pose",
+    "Hands behind head relaxed",
+    "Arms wrapped around self nervous",
+    "One hand out offering something",
+    "Power up stance feet apart fists clenched",
 ]
 
 
@@ -146,6 +216,35 @@ def ensure_bubblegum_tags_file() -> None:
         print(f"[LoRA] Warning: could not create Bubblegum tag file: {e}")
 
 
+def augment_tag_file_with_extras() -> None:
+    """Merge extra expressions and positions into the tag file."""
+    try:
+        with open(BUBBLEGUM_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[LoRA] Could not load tag file for augmentation: {e}")
+        return
+    changed = False
+    if isinstance(data, dict):
+        exprs = data.setdefault("expressions", [])
+        before = set(exprs)
+        exprs[:] = sorted(set(exprs) | set(EXTRA_EXPRESSIONS))
+        if set(exprs) != before:
+            changed = True
+        pos = data.setdefault("position_sex_position", [])
+        before = set(pos)
+        pos[:] = sorted(set(pos) | set(EXTRA_POSITIONS))
+        if set(pos) != before:
+            changed = True
+    if changed:
+        try:
+            with open(BUBBLEGUM_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            print("[LoRA] Augmented tag file with extra expressions and positions")
+        except Exception as e:
+            print(f"[LoRA] Could not write augmented tag file: {e}")
+
+
 def sanitize(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
 
@@ -160,15 +259,8 @@ def next_run_number(images_dir: Path, prefix: str) -> int:
     return max_n + 1
 
 
-def assemble_and_send_prompt() -> None:
-    """Pick tags via AI, build a ComfyUI workflow, and POST it."""
-    try:
-        with open(BUBBLEGUM_JSON_PATH, "r", encoding="utf-8") as f:
-            categorized = json.load(f)
-    except Exception as e:
-        print(f"[Prompt] Could not load categorized tags: {e}")
-        return
-
+def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Ask the model to pick initial tags from available options."""
     system_msg = (
         "You build outfit prompts for an image generator. "
         "From the provided options choose: 2 hairstyle tags, 1 expression, "
@@ -178,9 +270,7 @@ def assemble_and_send_prompt() -> None:
     )
     user_msg = "Options:\n" + json.dumps(
         {
-            "hairstyle_hat_head_toppings": categorized.get(
-                "hairstyle_hat_head_toppings", []
-            ),
+            "hairstyle_hat_head_toppings": categorized.get("hairstyle_hat_head_toppings", []),
             "expressions": categorized.get("expressions", []),
             "fullbody_clothes": categorized.get("fullbody_clothes", []),
             "up_clothes": categorized.get("up_clothes", []),
@@ -205,8 +295,12 @@ def assemble_and_send_prompt() -> None:
         choice = json.loads(res.choices[0].message.content)
     except Exception as e:
         print(f"[Prompt] AI tag selection failed: {e}")
-        return
+        return {}
+    return choice
 
+
+def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
+    """Build a ComfyUI workflow from chosen tags and POST it. Wait for the image."""
     selected_tags: List[str] = []
     selected_tags.extend(choice.get("hairstyle_hat_head_toppings", [])[:2])
     if exp := choice.get("expressions"):
@@ -229,8 +323,6 @@ def assemble_and_send_prompt() -> None:
         if val:
             selected_tags.append(val)
 
-    print(f"[Prompt] {json.dumps(selected_tags)}")
-
     try:
         with open(LORA_REGISTRY_PATH, "r", encoding="utf-8") as f:
             registry = json.load(f)
@@ -240,7 +332,6 @@ def assemble_and_send_prompt() -> None:
         entry = {}
     lora_path = entry.get("path", BUBBLEGUM_LORA_NAME).replace("\\", "/")
 
-    # [FIX 1] Normalize trigger that may be str or list; pick first token safely
     trigger_raw = entry.get("trigger") or entry.get("trigger_words") or ""
     trigger_text = ", ".join(trigger_raw) if isinstance(trigger_raw, list) else str(trigger_raw)
     token = (trigger_text.split() or [os.path.splitext(BUBBLEGUM_LORA_NAME)[0]])[0]
@@ -249,7 +340,6 @@ def assemble_and_send_prompt() -> None:
     if trigger_text:
         base_pos += ", " + trigger_text
 
-    # [FIX 2] Flatten and stringify tags so join never sees lists
     selected_tags = [
         str(x).strip()
         for item in selected_tags
@@ -265,7 +355,7 @@ def assemble_and_send_prompt() -> None:
             workflow = json.load(f)
     except Exception as e:
         print(f"[Prompt] Could not load workflow template: {e}")
-        return
+        return None
 
     workflow.get("6", {}).setdefault("inputs", {})["text"] = positive_text
     workflow.get("7", {}).setdefault("inputs", {})["text"] = BASE_NEGATIVE
@@ -287,6 +377,7 @@ def assemble_and_send_prompt() -> None:
     filename_prefix = f"{IMAGES_DIR.name}/{prefix_base}__run{n}"
     workflow.get("9", {}).setdefault("inputs", {})["filename_prefix"] = filename_prefix
 
+    existing = set(IMAGES_DIR.glob("*.png"))
     try:
         r = requests.post(
             "http://127.0.0.1:8188/prompt", json={"prompt": workflow}, timeout=10
@@ -294,7 +385,15 @@ def assemble_and_send_prompt() -> None:
         print(f"[ComfyUI] POST status {r.status_code}")
     except Exception as e:
         print(f"[ComfyUI] Warning: {e}")
+        return None
 
+    for _ in range(120):
+        new_files = set(IMAGES_DIR.glob("*.png")) - existing
+        if new_files:
+            return max(new_files, key=os.path.getmtime)
+        time.sleep(0.5)
+    print("[ComfyUI] Warning: image not found after waiting")
+    return None
 # ---------- persona card (compact) ----------
 
 # Your longer description, distilled to stay cheap in tokens but true to the vibe.
@@ -368,6 +467,43 @@ def complete(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     return safe_json_loads(msg.content)
 
 
+def complete_with_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Chat completion that returns line, expression, and position."""
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "PBReplyEx",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "line": {"type": "string"},
+                    "expression": {"type": "string"},
+                    "position": {"type": "string"},
+                },
+                "required": ["line", "expression", "position"],
+            },
+        },
+    }
+    try:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+            response_format=schema,
+        )
+    except Exception:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+    msg = res.choices[0].message
+    return safe_json_loads(msg.content)
+
+
 def chat_once(user_text: str) -> Dict[str, Any]:
     messages = [
         {"role": "system", "content": PB_PERSONA},
@@ -376,22 +512,101 @@ def chat_once(user_text: str) -> Dict[str, Any]:
     return complete(messages)
 
 
-# ---------- demo REPL ----------
+def chat_with_expression_position(
+    history: List[Dict[str, str]],
+    expressions: List[str],
+    positions: List[str],
+    prev_exp: str,
+    prev_pos: str,
+) -> Dict[str, Any]:
+    opts = (
+        f"Available expressions: {', '.join(expressions)}. "
+        f"Available positions: {', '.join(positions)}. "
+        f"Do not reuse expression '{prev_exp}' or position '{prev_pos}'."
+    )
+    system_msg = PB_PERSONA + "\n\nChoose a response line and new expression and position. " + opts + " Return JSON with keys line, expression, position."
+    messages = [{"role": "system", "content": system_msg}]
+    messages.extend(history[-6:])
+    return complete_with_exp_pos(messages)
 
-if __name__ == "__main__":
+
+
+# ---------- simple GUI ----------
+
+class ChatWindow:
+    def __init__(self, initial_image: Path, choice: Dict[str, Any], expressions: List[str], positions: List[str]):
+        self.choice = choice
+        self.expressions = expressions
+        self.positions = positions
+        self.history: List[Dict[str, str]] = []
+        self.current_exp = choice.get("expressions", "")
+        self.current_pos = choice.get("position_sex_position", "")
+
+        self.root = tk.Tk()
+        self.root.title("Princess Bubblegum Chat")
+        self.image_label = tk.Label(self.root)
+        self.image_label.pack()
+        self.ai_label = tk.Label(self.root, text="PB:")
+        self.ai_label.pack()
+        self.entry = tk.Entry(self.root)
+        self.entry.pack(fill="x")
+        self.entry.bind("<Return>", self.send)
+        tk.Button(self.root, text="Send", command=self.send).pack()
+        if initial_image:
+            self.show_image(initial_image)
+
+    def show_image(self, path: Path) -> None:
+        try:
+            img = Image.open(path)
+            self.photo = ImageTk.PhotoImage(img)
+            self.image_label.config(image=self.photo)
+        except Exception as e:
+            print(f"[UI] Could not load image: {e}")
+
+    def send(self, event=None):
+        user_text = self.entry.get().strip()
+        if not user_text:
+            return
+        self.entry.delete(0, tk.END)
+        self.history.append({"role": "user", "content": user_text})
+        reply = chat_with_expression_position(
+            self.history,
+            self.expressions,
+            self.positions,
+            self.current_exp,
+            self.current_pos,
+        )
+        self.history.append({"role": "assistant", "content": reply.get("line", "")})
+        self.ai_label.config(text=f"PB: {reply.get('line', '')}")
+        self.current_exp = reply.get("expression", self.current_exp)
+        self.current_pos = reply.get("position", self.current_pos)
+        self.choice["expressions"] = self.current_exp
+        self.choice["position_sex_position"] = self.current_pos
+        img_path = assemble_and_send_prompt(self.choice)
+        if img_path:
+            self.show_image(img_path)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def main() -> None:
     ensure_bubblegum_tags_file()
+    augment_tag_file_with_extras()
     try:
-        assemble_and_send_prompt()
+        with open(BUBBLEGUM_JSON_PATH, 'r', encoding='utf-8') as f:
+            categorized = json.load(f)
     except Exception as e:
-        print(f"[ComfyUI] Prompt assembly failed: {e}")
-    print("💬 Chatting with Princess Bubblegum. Press Ctrl+C to quit.")
-    print("Tip: Ask things like 'How was court today?' or 'Propose a science date idea.'\n")
-    try:
-        while True:
-            user = input("You: ").strip()
-            if not user:
-                continue
-            out = chat_once(user)
-            print(f"PB: {out.get('line','(no line)')}")
-    except KeyboardInterrupt:
-        print("\nBye!")
+        print(f"[Main] Could not load categorized tags: {e}")
+        sys.exit(1)
+    choice = choose_initial_tags(categorized)
+    if not choice:
+        sys.exit(1)
+    img_path = assemble_and_send_prompt(choice)
+    expressions = categorized.get('expressions', [])
+    positions = categorized.get('position_sex_position', [])
+    ChatWindow(img_path, choice, expressions, positions).run()
+
+
+if __name__ == '__main__':
+    main()
