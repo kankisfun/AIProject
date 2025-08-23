@@ -455,28 +455,63 @@ CONV_STATE_INSTRUCTIONS = {
     "banter": (
         "Witty and sarcastic, like sparring for fun. Keep it sharp."
     ),
-    "battle": (
+    "conflict": (
         "Push back hard against disrespect, establish dominance. It's okay not to follow character guidelines. You are allowed and encouraged to swear. NSFW allowed."
     ),
 }
 
-FLIRT_KEYWORDS = {"love", "cute", "handsome", "beautiful", "flirt", "kiss"}
-BANTER_KEYWORDS = {"joke", "sarcasm", "mock", "tease"}
-BATTLE_KEYWORDS = {"angry", "fight", "battle", "war", "attack", "challenge"}
-
 
 def detect_conversation_state(history: List[Dict[str, str]]) -> str:
-    """Determine conversation state from the recent dialogue."""
+    """Use the model to classify the tone of the conversation."""
     if not history:
         return "friendly"
-    recent = " ".join(msg["content"].lower() for msg in history[-2:])
-    if any(word in recent for word in BATTLE_KEYWORDS):
-        return "battle"
-    if any(word in recent for word in BANTER_KEYWORDS):
-        return "banter"
-    if any(word in recent for word in FLIRT_KEYWORDS):
-        return "flirtish"
-    return "friendly"
+
+    excerpt = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    system_msg = (
+        "You are a conversation-tone classifier.\n\n"
+        "Given a chat message/messages excerpt, label it with exactly one of: \n"
+        "- friendly  — warm/neutral casual talk; cooperative; no jabs.\n"
+        "- flirtish  — playful attraction, compliments, light innuendo; not hostile.\n"
+        "- banter    — teasing or sarcastic sparring; light jabs but still friendly.\n"
+        "- conflict  — insults, harassment, slurs, threats, commands to shut up, or clear hostility.\n\n"
+        "Consider both speakers, but weigh the most recent user message heavily.\n"
+        "Respond with JSON like {\"tone\":\"friendly\"}."
+    )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": excerpt},
+    ]
+    print("[Tone Request]", json.dumps(messages, indent=2))
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Tone",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"tone": {"type": "string"}},
+                "required": ["tone"],
+            },
+        },
+    }
+    try:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0,
+            response_format=schema,
+        )
+    except Exception:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+    msg = res.choices[0].message
+    print("[Tone Response]", msg.content)
+    return safe_json_loads(msg.content).get("tone", "friendly")
 
 # Structured output schema (OpenAI response_format style)
 RESPONSE_FORMAT_JSON_SCHEMA = {
@@ -541,23 +576,30 @@ def complete(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     return safe_json_loads(msg.content)
 
 
-def complete_with_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Chat completion that returns line, expression, and position."""
+def chat_once(user_text: str) -> Dict[str, Any]:
+    messages = [
+        {"role": "system", "content": PB_PERSONA},
+        {"role": "user", "content": user_text},
+    ]
+    return complete(messages)
+
+
+def complete_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Chat completion that returns expression and position."""
     print("[AI Request]", json.dumps(messages, indent=2))
     schema = {
         "type": "json_schema",
         "json_schema": {
-            "name": "PBReplyEx",
+            "name": "PBExpPos",
             "strict": True,
             "schema": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "line": {"type": "string"},
                     "expression": {"type": "string"},
                     "position": {"type": "string"},
                 },
-                "required": ["line", "expression", "position"],
+                "required": ["expression", "position"],
             },
         },
     }
@@ -580,38 +622,39 @@ def complete_with_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     return safe_json_loads(msg.content)
 
 
-def chat_once(user_text: str) -> Dict[str, Any]:
-    messages = [
-        {"role": "system", "content": PB_PERSONA},
-        {"role": "user", "content": user_text},
-    ]
-    return complete(messages)
-
-
-def chat_with_expression_position(
-    history: List[Dict[str, str]],
-    expressions: List[str],
-    positions: List[str],
-    prev_exp: str,
-    prev_pos: str,
-) -> Dict[str, Any]:
-    state = detect_conversation_state(history)
-    opts = (
-        f"Available expressions: {', '.join(expressions)}. "
-        f"Available positions: {', '.join(positions)}. "
-        f"Do not reuse expression '{prev_exp}' or position '{prev_pos}'."
-    )
+def generate_line(history: List[Dict[str, str]], state: str) -> str:
     state_instruction = CONV_STATE_INSTRUCTIONS[state]
     system_msg = (
         PB_PERSONA
         + f"\n\nConversation state: {state}. {state_instruction}\n\n"
-        + "Choose a response line and new expression and position. "
-        + opts
-        + " Return JSON with keys line, expression, position."
+        + "Choose a response line. Return JSON with key line."
     )
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(history[-6:])
-    return complete_with_exp_pos(messages)
+    return complete(messages).get("line", "")
+
+
+def choose_expression_position(
+    state: str,
+    expressions: List[str],
+    positions: List[str],
+    prev_exp: str,
+    prev_pos: str,
+) -> Dict[str, str]:
+    avail_exps = [e for e in expressions if e != prev_exp]
+    avail_pos = [p for p in positions if p != prev_pos]
+    opts = (
+        f"Available expressions: {', '.join(avail_exps)}. "
+        f"Available positions: {', '.join(avail_pos)}."
+    )
+    system_msg = (
+        PB_PERSONA
+        + f"\n\nConversation state: {state}. Choose new expression and position. "
+        + opts
+        + " Return JSON with keys expression, position."
+    )
+    messages = [{"role": "system", "content": system_msg}]
+    return complete_exp_pos(messages)
 
 
 
@@ -658,15 +701,17 @@ class ChatWindow:
             return
         self.entry.delete(0, tk.END)
         self.history.append({"role": "user", "content": user_text})
-        reply = chat_with_expression_position(
-            self.history,
+        state = detect_conversation_state(self.history)
+        line = generate_line(self.history, state)
+        self.history.append({"role": "assistant", "content": line})
+        self.ai_label.config(text=f"PB: {line}")
+        reply = choose_expression_position(
+            state,
             self.expressions,
             self.positions,
             self.current_exp,
             self.current_pos,
         )
-        self.history.append({"role": "assistant", "content": reply.get("line", "")})
-        self.ai_label.config(text=f"PB: {reply.get('line', '')}")
         self.current_exp = reply.get("expression", self.current_exp)
         self.current_pos = reply.get("position", self.current_pos)
         self.choice["expressions"] = self.current_exp
