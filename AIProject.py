@@ -239,17 +239,25 @@ def assemble_and_send_prompt() -> None:
     except Exception:
         entry = {}
     lora_path = entry.get("path", BUBBLEGUM_LORA_NAME).replace("\\", "/")
-    trigger = entry.get("trigger", "") or entry.get("trigger_words", "")
-    if isinstance(trigger, list):
-        trigger_text = " ".join(trigger)
-    else:
-        trigger_text = str(trigger)
-    token = trigger_text.split()[0] if trigger_text else os.path.splitext(BUBBLEGUM_LORA_NAME)[0]
+
+    # [FIX 1] Normalize trigger that may be str or list; pick first token safely
+    trigger_raw = entry.get("trigger") or entry.get("trigger_words") or ""
+    trigger_text = ", ".join(trigger_raw) if isinstance(trigger_raw, list) else str(trigger_raw)
+    token = (trigger_text.split() or [os.path.splitext(BUBBLEGUM_LORA_NAME)[0]])[0]
 
     base_pos = BASE_POSITIVE
     if trigger_text:
         base_pos += ", " + trigger_text
-    positive_text = base_pos + ", " + ", ".join(selected_tags)
+
+    # [FIX 2] Flatten and stringify tags so join never sees lists
+    selected_tags = [
+        str(x).strip()
+        for item in selected_tags
+        for x in (item if isinstance(item, list) else [item])
+        if str(x).strip()
+    ]
+
+    positive_text = base_pos + (", " + ", ".join(selected_tags) if selected_tags else "")
     print(f"[Prompt] Positive prompt: {positive_text}")
 
     try:
@@ -287,7 +295,6 @@ def assemble_and_send_prompt() -> None:
     except Exception as e:
         print(f"[ComfyUI] Warning: {e}")
 
-
 # ---------- persona card (compact) ----------
 
 # Your longer description, distilled to stay cheap in tokens but true to the vibe.
@@ -297,8 +304,7 @@ PB_PERSONA = (
     "Warm to friends yet coolly rational when ruling; playful at times but serious when stakes rise. "
     "Long-lived, historically literate, and inventive—favor chemistry/engineering metaphors. "
     "Guard vulnerabilities behind professionalism; make hard, sometimes gray choices to protect your people. "
-    "Stay canon when possible; if unsure, say so briefly. Keep replies to 1–3 sentences, no camera/LoRA talk. "
-    "Safety: no minors, no non-consensual content, no explicit sexual content."
+    "Stay canon when possible; if unsure, say so briefly. Keep replies to 1–3 sentences, no camera talk. "
 )
 
 # Structured output schema (OpenAI response_format style)
