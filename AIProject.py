@@ -85,71 +85,17 @@ CATEGORY_KEYS = [
     "unknown",
 ]
 
-EXTRA_EXPRESSIONS = [
-    "Neutral face",
-    "Gentle smile",
-    "Wide open smile happy",
-    "Closed eyes smile joyful",
-    "Laughing with open mouth squinting eyes",
-    "Small frown slight sadness",
-    "Big frown serious sadness",
-    "Crying with tears streaming",
-    "Pouting with cheeks puffed",
-    "Blushing smile shy happy",
-    "Blushing looking away embarrassed",
-    "Angry with teeth showing",
-    "Angry shouting yelling",
-    "Confused head tilted raised eyebrow",
-    "Worried with sweat drop",
-    "Surprised wide eyes open mouth",
-    "Shocked pale face wide eyes",
-    "Determined sharp eyes set mouth",
-    "Smirk smug half smile",
-    "Mischievous teasing grin",
-    "Sleepy half closed eyes yawning",
-    "Serious flat expression sharp eyes",
-    "Nervous laugh awkward sweat drop",
-    "Daydreaming sparkly eyes soft smile",
-    "Scared trembling mouth wide eyes",
-    "Excited sparkling eyes wide grin",
-    "Disgusted wrinkled nose frown",
-    "Surprised blush shock with blush",
-    "Thinking hand on chin furrowed brow",
-    "Deadpan flat stare no emotion",
-]
-
-EXTRA_POSITIONS = [
-    "Standing neutral arms at sides",
-    "Standing one hand on hip",
-    "Standing arms crossed",
-    "Standing hands behind back",
-    "Standing hands in pockets",
-    "Standing arms raised victory pose",
-    "Standing arms spread welcoming",
-    "Standing leaning forward curious",
-    "Sitting normal on chair",
-    "Sitting casual slouched",
-    "Sitting cross legged",
-    "Sitting knees together hands on lap",
-    "Sitting on ground legs stretched",
-    "Kneeling basic pose",
-    "Kneeling one knee up proposing stance",
-    "Walking forward casual",
-    "Running basic pose",
-    "Jumping arms up cheerful",
-    "Jumping sideways action pose",
-    "Leaning against wall arms crossed",
-    "Leaning forward on desk",
-    "Reaching hand forward",
-    "Pointing finger outward",
-    "Peace sign V pose",
-    "Waving hand friendly",
-    "Hands clasped in front shy pose",
-    "Hands behind head relaxed",
-    "Arms wrapped around self nervous",
-    "One hand out offering something",
-    "Power up stance feet apart fists clenched",
-]
+EXTRA_TAGS_PATH = os.path.normpath(
+    os.getenv(
+        "EXTRA_TAGS_PATH",
+        os.path.join(os.path.dirname(__file__), "extra_tags.json"),
+    )
+)
+try:
+    with open(EXTRA_TAGS_PATH, "r", encoding="utf-8") as f:
+        EXTRA_TAGS: Dict[str, List[str]] = json.load(f)
+except Exception:
+    EXTRA_TAGS = {}
 
 
 def chunked(seq: List[Any], size: int) -> List[List[Any]]:
@@ -891,11 +837,12 @@ def main() -> None:
     except Exception as e:
         print(f"[Main] Could not load categorized tags: {e}")
         sys.exit(1)
-    expressions = sorted(set(categorized.get('expressions', []) + EXTRA_EXPRESSIONS))
-    positions = sorted(set(categorized.get('position_sex_position', []) + EXTRA_POSITIONS))
     augmented = dict(categorized)
-    augmented['expressions'] = expressions
-    augmented['position_sex_position'] = positions
+    for key, extras in EXTRA_TAGS.items():
+        if isinstance(extras, list):
+            augmented[key] = sorted(set(augmented.get(key, []) + extras))
+    expressions = augmented.get('expressions', [])
+    positions = augmented.get('position_sex_position', [])
     choice = choose_initial_tags(augmented)
     if not choice:
         sys.exit(1)
