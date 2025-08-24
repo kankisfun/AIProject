@@ -77,8 +77,6 @@ CATEGORY_KEYS = [
     "up_clothes",
     "bottom_clothes",
     "accessories",
-    "specific_body_parts",
-    "skin_fur",
     "position_sex_position",
     "background",
     "other",
@@ -187,11 +185,24 @@ def next_run_number(images_dir: Path, prefix: str) -> int:
 
 def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
     """Ask the model to pick initial tags from available options."""
+    instructions = ["2 hairstyle tags", "1 expression"]
+    if any(
+        categorized.get(cat)
+        for cat in ["fullbody_clothes", "up_clothes", "bottom_clothes"]
+    ):
+        instructions.append("1 fullbody outfit OR 1 top and 1 bottom")
+    if categorized.get("accessories"):
+        instructions.append("1 accessory")
+    instructions.append("1 position")
+    if categorized.get("background"):
+        instructions.append("1 background")
+    if len(instructions) > 1:
+        instr_text = ", ".join(instructions[:-1]) + ", and " + instructions[-1]
+    else:
+        instr_text = instructions[0]
     system_msg = (
         "You build outfit prompts for an image generator. "
-        "From the provided options choose: 2 hairstyle tags, 1 expression, "
-        "1 fullbody outfit OR 1 top and 1 bottom, 1 accessory, 1 specific body part, "
-        "1 skin type, 1 position, and 1 background. "
+        f"From the provided options choose: {instr_text}. "
         "Return JSON with only the selected tags in their respective fields; no extra text."
     )
     user_msg = "Options:\n" + json.dumps(
@@ -202,8 +213,6 @@ def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
             "up_clothes": categorized.get("up_clothes", []),
             "bottom_clothes": categorized.get("bottom_clothes", []),
             "accessories": categorized.get("accessories", []),
-            "specific_body_parts": categorized.get("specific_body_parts", []),
-            "skin_fur": categorized.get("skin_fur", []),
             "position_sex_position": categorized.get("position_sex_position", []),
             "background": categorized.get("background", []),
         }
@@ -234,8 +243,6 @@ def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
         "up_clothes": categorized.get("up_clothes", []),
         "bottom_clothes": categorized.get("bottom_clothes", []),
         "accessories": categorized.get("accessories", []),
-        "specific_body_parts": categorized.get("specific_body_parts", []),
-        "skin_fur": categorized.get("skin_fur", []),
         "position_sex_position": categorized.get("position_sex_position", []),
         "background": categorized.get("background", []),
     }
@@ -269,8 +276,6 @@ def assemble_and_send_prompt(choice: Dict[str, Any]) -> Path | None:
             selected_tags.append(bottom)
     for key in [
         "accessories",
-        "specific_body_parts",
-        "skin_fur",
         "position_sex_position",
         "background",
     ]:
@@ -566,11 +571,18 @@ def complete_exp_pos(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     return safe_json_loads(msg.content)
 
 
-def generate_line(history: List[Dict[str, str]], state: str) -> str:
+def generate_line(
+    history: List[Dict[str, str]],
+    state: str,
+    location: str = "",
+    clothes: str = "",
+) -> str:
     state_instruction = CONV_STATE_INSTRUCTIONS[state]
     system_msg = (
         PB_PERSONA
         + f"\n\nConversation state: {state}. {state_instruction}\n\n"
+        + f"You are currently in: {location}\n"
+        + f"You are currently wearing: {clothes}\n"
         + "Choose a response line that may include action cues in asterisks. Return JSON with key line."
     )
     messages = [{"role": "system", "content": system_msg}]
@@ -590,16 +602,13 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
         "You analyze the last player message and the last assistant message. "
         "Decide which of these categories should update tags: "
         "hairstyle_hat_head_toppings, fullbody_clothes, up_clothes, bottom_clothes, "
-        "accessories, specific_body_parts, skin_fur, background. "
+        "accessories, background. "
         "Examples: hairstyle_hat_head_toppings – hair changes or adding/removing "
         "hat/tiara/crown/glasses. fullbody_clothes/up_clothes/bottom_clothes – "
         "putting on or removing clothes or changing outfit type (e.g., dress → "
         "swimsuit). accessories – picking up or dropping accessories like "
         "clipboards, backpacks, heels, gloves, or equipping/removing footwear. "
-        "specific_body_parts – exposing or covering body parts (cleavage, armpits, "
-        "midriff) or emphasizing changes (showing thighs, flexing). skin_fur – skin "
-        "color changes or transforming into non-human forms (slime girl, monster "
-        "girl). background – moving location (indoors → outdoors) or weather/setting "
+        "background – moving location (indoors → outdoors) or weather/setting "
         "changes (rain, night, pool, fire). Return JSON with key 'categories' as a "
         "list. Use ['Nothing'] if no change."
     )
@@ -611,8 +620,6 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
         "up_clothes",
         "bottom_clothes",
         "accessories",
-        "specific_body_parts",
-        "skin_fur",
         "background",
     }
     schema = {
@@ -677,12 +684,15 @@ def choose_expression_position(
         + f"\n\nConversation state: {state}. Choose a new expression and a new position different from the previous ones."
     )
     if categories:
-        system_msg += (
-            " Also update these categories if needed: "
-            + ", ".join(categories)
-            + ". Follow rules: always return two hairstyle tags; choose either one fullbody outfit or one top and one bottom; accessories only when no fullbody outfit; specific_body_parts, skin_fur, background require exactly one tag each."
-            " Return JSON with keys expression, position and any updated categories."
-        )
+        system_msg += " Also update these categories if needed: " + ", ".join(categories)
+        system_msg += ". Follow rules: always return two hairstyle tags"
+        if any(c in categories for c in ["fullbody_clothes", "up_clothes", "bottom_clothes"]):
+            system_msg += "; choose either one fullbody outfit or one top and one bottom"
+        if "accessories" in categories:
+            system_msg += "; accessories only when no fullbody outfit"
+        if "background" in categories:
+            system_msg += "; background requires exactly one tag"
+        system_msg += ". Return JSON with keys expression, position and any updated categories."
     else:
         system_msg += " Return JSON with keys expression, position."
     current: Dict[str, Any] = {}
@@ -834,7 +844,7 @@ def enforce_tag_rules(choice: Dict[str, Any], catalog: Dict[str, List[str]]) -> 
             choice["accessories"] = acc[0] if acc else None
 
     # ensure single tags for mandatory categories
-    for key in ["specific_body_parts", "skin_fur", "background"]:
+    for key in ["background"]:
         val = choice.get(key)
         if isinstance(val, list):
             val = val[0] if val else None
@@ -896,7 +906,23 @@ class ChatWindow:
         self.entry.delete(0, tk.END)
         self.history.append({"role": "user", "content": user_text})
         state = detect_conversation_state(self.history)
-        line = generate_line(self.history, state)
+        location = self.choice.get("background", "")
+        clothes_tags: List[str] = []
+        if self.choice.get("fullbody_clothes"):
+            clothes_tags.append(self.choice["fullbody_clothes"])
+        else:
+            if self.choice.get("up_clothes"):
+                clothes_tags.append(self.choice["up_clothes"])
+            if self.choice.get("bottom_clothes"):
+                clothes_tags.append(self.choice["bottom_clothes"])
+        acc = self.choice.get("accessories")
+        if acc:
+            if isinstance(acc, list):
+                clothes_tags.extend(acc)
+            else:
+                clothes_tags.append(acc)
+        clothes = ", ".join(t for t in clothes_tags if t)
+        line = generate_line(self.history, state, location, clothes)
         self.history.append({"role": "assistant", "content": line})
         self.ai_label.config(text=f"PB: {line}")
         categories = decide_tag_categories(self.history)
