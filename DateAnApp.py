@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Date an App - chat and ComfyUI image generator
+
+This script lets a user pick an application, have AI describe it and turn it
+into a character, then chat with that character while generating images via
+ComfyUI.  It is a simplified variant of AIProject.py using a zero-LoRA
+workflow.
+"""
+import os
+import re
+import sys
+import json
+import time
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image, ImageTk
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ---------- environment & client ----------
+
+load_dotenv()
+
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
+BASE_URL = os.getenv("TOGETHER_BASE_URL", "https://api.together.xyz/v1")
+MODEL = os.getenv("TOGETHER_CHAT_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
+
+if not TOGETHER_API_KEY:
+    raise SystemExit("Missing TOGETHER_API_KEY in .env")
+
+client = OpenAI(api_key=TOGETHER_API_KEY, base_url=BASE_URL)
+
+# ---------- paths & constants ----------
+
+BASE_POSITIVE = "high quality"
+BASE_NEGATIVE = (
+    "low quality, jpeg artifacts, deformed, extra fingers, text, watermark, logo, censored"
+)
+
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+COMFY_OUTPUT_DIR = Path(
+    os.getenv("COMFY_OUTPUT_DIR", r"E:\\ConfyUI_New\\ComfyUI\\output")
+)
+WATCH_DIR = COMFY_OUTPUT_DIR / IMAGES_DIR.name
+WATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+EXTRA_TAGS_PATH = os.path.join(os.path.dirname(__file__), "extra_tags.json")
+try:
+    with open(EXTRA_TAGS_PATH, "r", encoding="utf-8") as f:
+        EXTRA_TAGS: Dict[str, List[str]] = json.load(f)
+except Exception:
+    EXTRA_TAGS = {}
+
+# ---------- utilities ----------
+
+def sanitize(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
+
+def next_run_number(images_dir: Path, prefix: str) -> int:
+    pattern = re.compile(rf"{re.escape(prefix)}__run(\d+)")
+    max_n = -1
+    for p in images_dir.glob(f"{prefix}__run*"):
+        m = pattern.search(p.stem)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+# ---------- initial setup ----------
+
+def choose_file() -> str:
+    root = tk.Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename()
+    root.destroy()
+    if not path:
+        raise SystemExit("No file chosen")
+    return os.path.basename(path)
+
+def recognize_app(app_name: str) -> str:
+    system_msg = "You are an AI app recognizer program."
+    user_msg = (
+        f"Program: {app_name}\n"
+        "1. What is this program/game/app?\n"
+        "2. What do internet users and memes think about this app?\n"
+        "3. What this app icon looks like and what color pallete it uses (what are the leading colors)?"
+    )
+    res = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+    )
+    return res.choices[0].message.content.strip()
+
+def create_character(app_name: str, app_info: str) -> Dict[str, str]:
+    system_msg = "You design characters based on apps. Respond in JSON."
+    user_msg = (
+        f"App name: {app_name}\nInfo: {app_info}\n"
+        "Based on this app/program/game name, it's icon, it's description and memes answer following questions:\n"
+        "1. What would this icon look like as a character?\n"
+        "2. What would this icon be called as a character? (Perhaps make a simple pun based on the icon name)\n"
+        "3. What kind of character could this app have (consider internet users' opinions)\n\n"
+        "Return JSON with keys name, sex (male/female), appearance (3 sentences), personality (3 sentences)."
+    )
+    res = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.7,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(res.choices[0].message.content)
+    return {
+        "name": data.get("name", "Unknown"),
+        "sex": data.get("sex", "female"),
+        "appearance": data.get("appearance", ""),
+        "personality": data.get("personality", ""),
+    }
+
+def generate_tags(character: Dict[str, str]) -> Dict[str, str]:
+    system_msg = (
+        "Create simple two-word tags for a character. Respond in JSON with keys:"
+        " hair_type, hair_color, body_type, skin, accessories, background, clothes1, clothes2."
+    )
+    user_msg = (
+        f"Character name: {character['name']}\n"
+        f"Sex: {character['sex']}\n"
+        f"Appearance: {character['appearance']}\n"
+        f"Personality: {character['personality']}"
+    )
+    res = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.7,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        response_format={"type": "json_object"},
+    )
+    return json.loads(res.choices[0].message.content)
+
+def choose_expression_position(
+    prev_exp: str, prev_pos: str, expressions: List[str], positions: List[str]
+) -> Tuple[str, str]:
+    avail_exp = [e for e in expressions if e != prev_exp] or expressions
+    avail_pos = [p for p in positions if p != prev_pos] or positions
+    system_msg = (
+        "Choose a new expression and a new position from the provided lists. "
+        "They must be different from the previous ones. Return JSON with keys expression and position."
+    )
+    payload = {
+        "expressions": avail_exp,
+        "positions": avail_pos,
+        "previous_expression": prev_exp,
+        "previous_position": prev_pos,
+    }
+    res = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.7,
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": json.dumps(payload)}],
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(res.choices[0].message.content)
+    return data.get("expression", prev_exp), data.get("position", prev_pos)
+
+# ---------- ComfyUI prompt ----------
+
+def assemble_and_send_prompt(sex: str, tags: Dict[str, str], token: str) -> Path | None:
+    parts: List[str] = []
+    if tags.get("hair_type"):
+        parts.append(f"{tags['hair_type']} hair")
+    if tags.get("hair_color"):
+        parts.append(f"{tags['hair_color']} hair")
+    if tags.get("body_type"):
+        parts.append(tags["body_type"])
+    if tags.get("expression"):
+        parts.append(tags["expression"])
+    if tags.get("position"):
+        parts.append(tags["position"])
+    if tags.get("skin"):
+        parts.append(tags["skin"])
+    if tags.get("accessories"):
+        parts.append(tags["accessories"])
+    if tags.get("background"):
+        parts.append(tags["background"] + " background")
+    if tags.get("clothes1"):
+        parts.append(tags["clothes1"])
+    if tags.get("clothes2"):
+        parts.append(tags["clothes2"])
+    positive_text = BASE_POSITIVE + f", 1{sex}" + (", " + ", ".join(parts) if parts else "")
+
+    try:
+        with open("0lora.json", "r", encoding="utf-8") as f:
+            workflow = json.load(f)
+    except Exception as e:
+        print(f"[Prompt] Could not load workflow template: {e}")
+        return None
+
+    workflow.get("6", {}).setdefault("inputs", {})["text"] = positive_text
+    workflow.get("7", {}).setdefault("inputs", {})["text"] = BASE_NEGATIVE
+    workflow.get("3", {}).setdefault("inputs", {})["seed"] = 504
+    workflow.get("4", {}).setdefault("inputs", {})["ckpt_name"] = "waiNSFWIllustrious_v120.safetensors"
+    workflow.get("12", {}).setdefault("inputs", {})["model_name"] = "RealESRGAN_x4plus.pth"
+
+    short_slug = "__".join(sanitize(t) for t in parts[:3])
+    prefix_base = f"{sanitize(token)}__{short_slug}" if short_slug else sanitize(token)
+    n = next_run_number(IMAGES_DIR, prefix_base)
+    filename_prefix = f"{IMAGES_DIR.name}/{prefix_base}__run{n}"
+    workflow.get("9", {}).setdefault("inputs", {})["filename_prefix"] = filename_prefix
+    expected_prefix = Path(filename_prefix).name
+
+    existing = set(WATCH_DIR.glob(f"{expected_prefix}*.png"))
+
+    payload = {"prompt": workflow}
+    try:
+        r = requests.post("http://127.0.0.1:8188/prompt", json=payload, timeout=10)
+        print(f"[ComfyUI] POST status {r.status_code}")
+        print(f"[ComfyUI] Response body: {r.text}")
+    except Exception as e:
+        print(f"[ComfyUI] Warning: {e}")
+        return None
+
+    for _ in range(240):
+        new_files = set(WATCH_DIR.glob(f"{expected_prefix}*.png")) - existing
+        if new_files:
+            candidate = max(new_files, key=os.path.getmtime)
+            last_size = -1
+            for _ in range(20):
+                try:
+                    sz = candidate.stat().st_size
+                    if sz == last_size:
+                        with Image.open(candidate) as im:
+                            im.verify()
+                        return candidate
+                    last_size = sz
+                    time.sleep(0.5)
+                except Exception:
+                    time.sleep(0.5)
+        time.sleep(0.5)
+    print("[ComfyUI] Warning: image not found or incomplete")
+    return None
+
+# ---------- chat window ----------
+
+def recent_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    user_idx: List[int] = []
+    ai_idx: List[int] = []
+    for i in range(len(history) - 1, -1, -1):
+        role = history[i]["role"]
+        if role == "user" and len(user_idx) < 3:
+            user_idx.append(i)
+        elif role == "assistant" and len(ai_idx) < 3:
+            ai_idx.append(i)
+        if len(user_idx) >= 3 and len(ai_idx) >= 3:
+            break
+    idx = sorted(user_idx + ai_idx)
+    return [history[i] for i in idx]
+
+class ChatWindow:
+    def __init__(self, app_name: str, character: Dict[str, str], tags: Dict[str, str]):
+        self.app_name = app_name
+        self.character = character
+        self.base_tags = tags
+        self.expressions = EXTRA_TAGS.get("expressions", [])
+        self.positions = EXTRA_TAGS.get("position_sex_position", [])
+        self.expression = ""
+        self.position = ""
+        self.history: List[Dict[str, str]] = []
+        self.token = sanitize(character["name"] or app_name)
+        self.system_prompt = (
+            f"You are {character['name']}, a character based on {app_name}. "
+            f"Appearance: {character['appearance']} "
+            f"Personality: {character['personality']} "
+            f"Background: {tags.get('background', '')}. Stay in character."
+        )
+
+        self.root = tk.Tk()
+        self.root.title(character["name"])
+        self.image_label = tk.Label(self.root)
+        self.image_label.pack()
+        self.ai_label = tk.Label(self.root, text=f"{character['name']}:")
+        self.ai_label.pack()
+        self.entry = tk.Entry(self.root)
+        self.entry.pack(fill="x")
+        self.entry.bind("<Return>", self.send)
+        tk.Button(self.root, text="Send", command=self.send).pack()
+        self.initial_message()
+
+    def initial_message(self) -> None:
+        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": "Introduce yourself."}]
+        res = client.chat.completions.create(model=MODEL, messages=messages)
+        line = res.choices[0].message.content.strip()
+        self.history.append({"role": "assistant", "content": line})
+        self.ai_label.config(text=f"{self.character['name']}: {line}")
+        self.update_image()
+
+    def show_image(self, path: Path) -> None:
+        try:
+            img = Image.open(path)
+            img.thumbnail((720, 1080), Image.Resampling.LANCZOS)
+            self.photo = ImageTk.PhotoImage(img)
+            self.image_label.config(image=self.photo)
+            self.image_label.image = self.photo
+        except Exception as e:
+            print(f"[UI] Could not load image: {e}")
+
+    def update_image(self) -> None:
+        exp, pos = choose_expression_position(
+            self.expression, self.position, self.expressions, self.positions
+        )
+        self.expression = exp or self.expression
+        self.position = pos or self.position
+        tags = dict(self.base_tags)
+        tags["expression"] = self.expression
+        tags["position"] = self.position
+        img_path = assemble_and_send_prompt(self.character["sex"], tags, self.token)
+        if img_path:
+            self.show_image(img_path)
+
+    def send(self, event=None):
+        user_text = self.entry.get().strip()
+        if not user_text:
+            return
+        self.entry.delete(0, tk.END)
+        self.history.append({"role": "user", "content": user_text})
+        msgs = [{"role": "system", "content": self.system_prompt}]
+        msgs.extend(recent_messages(self.history))
+        res = client.chat.completions.create(model=MODEL, messages=msgs)
+        reply = res.choices[0].message.content.strip()
+        self.history.append({"role": "assistant", "content": reply})
+        self.ai_label.config(text=f"{self.character['name']}: {reply}")
+        self.update_image()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+# ---------- main ----------
+
+def main() -> None:
+    app_name = choose_file()
+    app_info = recognize_app(app_name)
+    character = create_character(app_name, app_info)
+    tags = generate_tags(character)
+    ChatWindow(app_name, character, tags).run()
+
+if __name__ == "__main__":
+    main()
