@@ -85,9 +85,179 @@ def log_prompt(title: str, messages: List[Dict[str, str]]) -> None:
                 pass
         print(f"{role}:\n{content}\n")
 
+# ---------- conversation tone ----------
+
+CONV_STATE_INSTRUCTIONS = {
+    "friendly": (
+        "Keep it neutral-positive."
+    ),
+    "flirtish": (
+        "Keep responses short and snapp, Keep it suggestive, be vulgar at a times. NSFW allowed."
+    ),
+    "banter": (
+        "Witty and sarcastic, like sparring for fun. Keep it sharp."
+    ),
+    "conflict": (
+        "Push back hard against disrespect, establish dominance. It's okay not to follow character guidelines. You are allowed and encouraged to swear. NSFW allowed."
+    ),
+}
+
+
+def safe_json_loads(maybe_json: str) -> Dict[str, Any]:
+    """Parse JSON; if it fails, try to extract the first {...} block."""
+    try:
+        return json.loads(maybe_json)
+    except Exception:
+        m = re.search(r"\{.*\}", maybe_json, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {"tone": maybe_json.strip()}
+
+
+def detect_conversation_state(history: List[Dict[str, str]]) -> str:
+    """Use the model to classify the tone of the conversation."""
+    if not history:
+        return "friendly"
+    excerpt = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    system_msg = (
+        "You are a conversation-tone classifier.\n\n"
+        "Given a chat message/messages excerpt, label it with exactly one of: \n"
+        "- friendly  — warm/neutral casual talk; cooperative; no jabs.\n"
+        "- flirtish  — playful attraction, compliments, light innuendo; not hostile.\n"
+        "- banter    — teasing or sarcastic sparring; light jabs but still friendly.\n"
+        "- conflict  — insults, harassment, slurs, threats, commands to shut up, or clear hostility.\n\n"
+        "Consider both speakers, but weigh the most recent user message heavily.\n"
+        "Respond with JSON like {\"tone\":\"friendly\"}."
+    )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": excerpt},
+    ]
+    print("[Tone Request]", json.dumps(messages, indent=2))
+    schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Tone",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"tone": {"type": "string"}},
+                "required": ["tone"],
+            },
+        },
+    }
+    try:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0,
+            response_format=schema,
+        )
+    except Exception:
+        res = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+    msg = res.choices[0].message
+    print("[Tone Response]", msg.content)
+    return safe_json_loads(msg.content).get("tone", "friendly")
+
 # ---------- initial setup ----------
 
-def choose_file() -> str:
+def resolve_shortcut(path: str) -> str:
+    """Resolve a Windows .lnk shortcut to its target path."""
+    if path.lower().endswith(".lnk"):
+        try:
+            import win32com.client  # type: ignore
+
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortCut(path)
+            if shortcut.Targetpath:
+                return shortcut.Targetpath
+        except Exception:
+            pass
+    return path
+
+
+def get_product_name(path: str) -> str:
+    """Get product name from executable metadata or fallback names."""
+    target = resolve_shortcut(path)
+    name = Path(target).stem
+    try:
+        import win32api  # type: ignore
+
+        info = win32api.GetFileVersionInfo(target, "\\")
+        trans = win32api.VerQueryValue(info, r"\VarFileInfo\Translation")[0]
+        lang_code = f"{trans[0]:04X}{trans[1]:04X}"
+        product = win32api.VerQueryValue(
+            info, rf"\StringFileInfo\{lang_code}\ProductName"
+        )
+        if product:
+            return product
+    except Exception:
+        pass
+    parent = os.path.basename(os.path.dirname(target))
+    return parent or name
+
+
+def gather_shortcuts() -> List[Tuple[str, str]]:
+    """Collect .lnk files from Desktop and Start Menu."""
+    locations = []
+    user = os.environ.get("USERPROFILE", "")
+    public = os.environ.get("PUBLIC", "")
+    appdata = os.environ.get("APPDATA", "")
+    if user:
+        locations.append(Path(user) / "Desktop")
+    if public:
+        locations.append(Path(public) / "Desktop")
+    if appdata:
+        locations.append(Path(appdata) / r"Microsoft\Windows\Start Menu\Programs")
+    entries: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+    for loc in locations:
+        if loc.exists():
+            for p in loc.rglob("*.lnk"):
+                target = resolve_shortcut(str(p))
+                if target in seen:
+                    continue
+                seen.add(target)
+                name = get_product_name(str(p))
+                entries.append((name, target))
+    return sorted(entries, key=lambda x: x[0].lower())
+
+
+def choose_app() -> str:
+    shortcuts = gather_shortcuts()
+    if shortcuts:
+        root = tk.Tk()
+        root.title("Choose Application")
+        lb = tk.Listbox(root, width=50, height=20)
+        for name, _ in shortcuts:
+            lb.insert(tk.END, name)
+        lb.pack()
+        result: Dict[str, str] = {}
+
+        def on_select(event=None):
+            sel = lb.curselection()
+            if sel:
+                result["name"] = shortcuts[sel[0]][0]
+                root.destroy()
+
+        lb.bind("<Double-Button-1>", on_select)
+        tk.Button(root, text="OK", command=on_select).pack()
+        root.mainloop()
+        if "name" in result:
+            print(f"[Main] Selected: {result['name']}")
+            return result["name"]
+        raise SystemExit("No app chosen")
+
+    # Fallback to manual browsing
     print("[Main] Please choose an application file.")
     root = tk.Tk()
     root.withdraw()
@@ -95,8 +265,9 @@ def choose_file() -> str:
     root.destroy()
     if not path:
         raise SystemExit("No file chosen")
+    name = get_product_name(path)
     print(f"[Main] Selected file: {path}")
-    return os.path.basename(path)
+    return name
 
 def recognize_app(app_name: str) -> str:
     print(f"[AI] Recognizing app '{app_name}'...")
@@ -305,7 +476,7 @@ class ChatWindow:
         self.position = ""
         self.history: List[Dict[str, str]] = []
         self.token = sanitize(character["name"] or app_name)
-        self.system_prompt = (
+        self.base_prompt = (
             f"You are {character['name']}, a character based on {app_name}. "
             f"Appearance: {character['appearance']} "
             f"Personality: {character['personality']} "
@@ -326,8 +497,10 @@ class ChatWindow:
 
     def initial_message(self) -> None:
         print("[Chat] Sending initial message to AI...")
+        state_instruction = CONV_STATE_INSTRUCTIONS["friendly"]
+        system_prompt = self.base_prompt + f" Conversation state: friendly. {state_instruction}"
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": "Introduce yourself."},
         ]
         log_prompt("Initial chat", messages)
@@ -367,7 +540,10 @@ class ChatWindow:
             return
         self.entry.delete(0, tk.END)
         self.history.append({"role": "user", "content": user_text})
-        msgs = [{"role": "system", "content": self.system_prompt}]
+        state = detect_conversation_state(self.history)
+        instruction = CONV_STATE_INSTRUCTIONS.get(state, "")
+        system_prompt = self.base_prompt + f" Conversation state: {state}. {instruction}"
+        msgs = [{"role": "system", "content": system_prompt}]
         msgs.extend(recent_messages(self.history))
         log_prompt("Chat", msgs)
         res = client.chat.completions.create(model=MODEL, messages=msgs)
@@ -384,7 +560,7 @@ class ChatWindow:
 
 def main() -> None:
     print("[Main] Starting Date an App...")
-    app_name = choose_file()
+    app_name = choose_app()
     app_info = recognize_app(app_name)
     character = create_character(app_name, app_info)
     tags = generate_tags(character)
