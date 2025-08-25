@@ -206,6 +206,73 @@ def get_product_name(path: str) -> str:
     return parent or name
 
 
+def _find_exe_in_dir(directory: Path) -> str | None:
+    """Return path to a non-generic exe in directory (depth 1)."""
+    if not directory.exists():
+        return None
+    generic = {
+        "setup",
+        "update",
+        "uninstall",
+        "launcher",
+        "helper",
+        "install",
+    }
+    for exe in directory.glob("*.exe"):
+        name = get_product_name(str(exe))
+        if name.lower() not in generic and exe.is_file():
+            return str(exe)
+    return None
+
+
+def gather_registry_apps() -> List[Tuple[str, str]]:
+    """Read Windows uninstall registry keys for installed apps."""
+    apps: List[Tuple[str, str]] = []
+    try:  # pragma: no cover - Windows only
+        import winreg
+
+        roots = [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]
+        subkeys = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ]
+        seen: set[str] = set()
+        for root in roots:
+            for sub in subkeys:
+                try:
+                    with winreg.OpenKey(root, sub) as hkey:
+                        for i in range(winreg.QueryInfoKey(hkey)[0]):
+                            try:
+                                skn = winreg.EnumKey(hkey, i)
+                                with winreg.OpenKey(hkey, skn) as sk:
+                                    name = winreg.QueryValueEx(sk, "DisplayName")[0]
+                                    icon = ""
+                                    loc = ""
+                                    try:
+                                        icon = winreg.QueryValueEx(sk, "DisplayIcon")[0]
+                                    except Exception:
+                                        pass
+                                    try:
+                                        loc = winreg.QueryValueEx(sk, "InstallLocation")[0]
+                                    except Exception:
+                                        pass
+                                    path = ""
+                                    if icon:
+                                        path = icon.split(",")[0].strip('"')
+                                    elif loc:
+                                        path = _find_exe_in_dir(Path(loc)) or ""
+                                    if name and path and path.lower() not in seen:
+                                        apps.append((name, path))
+                                        seen.add(path.lower())
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return apps
+
+
 def gather_shortcuts() -> List[Tuple[str, str]]:
     """Collect .lnk files from Desktop and Start Menu."""
     locations = []
@@ -232,13 +299,142 @@ def gather_shortcuts() -> List[Tuple[str, str]]:
     return sorted(entries, key=lambda x: x[0].lower())
 
 
-def choose_app() -> str:
-    shortcuts = gather_shortcuts()
-    if shortcuts:
+def gather_steam_games() -> List[Tuple[str, str]]:
+    """Return installed Steam games using library manifests."""
+    games: List[Tuple[str, str]] = []
+    try:  # pragma: no cover - Windows only
+        import winreg
+
+        steam_path = ""
+        for root in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
+            try:
+                with winreg.OpenKey(root, r"SOFTWARE\Valve\Steam") as k:
+                    steam_path = winreg.QueryValueEx(k, "SteamPath")[0]
+                    break
+            except Exception:
+                continue
+        if not steam_path:
+            return []
+        steam_path = steam_path.replace("/", "\\")
+        libraries = [Path(steam_path) / "steamapps"]
+        lib_file = libraries[0] / "libraryfolders.vdf"
+        if lib_file.exists():
+            txt = lib_file.read_text(encoding="utf-8", errors="ignore")
+            for m in re.finditer(r'"\d+"\s*"([^"]+)"', txt):
+                libraries.append(Path(m.group(1).replace("/", "\\")) / "steamapps")
+        for lib in libraries:
+            for manifest in lib.glob("appmanifest_*.acf"):
+                try:
+                    content = manifest.read_text(encoding="utf-8", errors="ignore")
+                    name_m = re.search(r'"name"\s*"([^"]+)"', content)
+                    dir_m = re.search(r'"installdir"\s*"([^"]+)"', content)
+                    if not name_m or not dir_m:
+                        continue
+                    name = name_m.group(1)
+                    installdir = lib / "common" / dir_m.group(1)
+                    path = _find_exe_in_dir(installdir)
+                    if path:
+                        games.append((name, path))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return games
+
+
+def gather_riot_games() -> List[Tuple[str, str]]:
+    """Enumerate Riot-installed games."""
+    games: List[Tuple[str, str]] = []
+    base = Path(r"C:\Riot Games")
+    if base.exists():
+        for child in base.iterdir():
+            if child.is_dir():
+                exe = _find_exe_in_dir(child)
+                if exe:
+                    name = get_product_name(exe)
+                    games.append((name, exe))
+    meta_dir = Path(r"C:\ProgramData\Riot Games\Metadata")
+    if meta_dir.exists():
+        for meta in meta_dir.glob("*.json"):
+            try:
+                data = json.loads(meta.read_text(encoding="utf-8"))
+                name = data.get("product_name") or data.get("name")
+                path = data.get("product_install_full_path")
+                if name and path:
+                    games.append((name, path))
+            except Exception:
+                continue
+    return games
+
+
+def scan_common_folders() -> List[Tuple[str, str]]:
+    """Fallback: scan common install folders for executables."""
+    dirs: List[Path] = []
+    for env in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]:
+        p = os.environ.get(env)
+        if p:
+            dirs.append(Path(p))
+    for extra in [Path(r"C:\Games"), Path(r"D:\Games")]:
+        dirs.append(extra)
+    results: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+    generic = {
+        "setup",
+        "update",
+        "launcher",
+        "install",
+        "uninstall",
+    }
+    for base in dirs:
+        if not base.exists():
+            continue
+        for root, subdirs, files in os.walk(base):
+            depth = Path(root).relative_to(base).parts
+            if len(depth) >= 3:
+                subdirs[:] = []
+            for f in files:
+                if not f.lower().endswith(".exe"):
+                    continue
+                path = os.path.join(root, f)
+                name = get_product_name(path)
+                if name.lower() in generic:
+                    continue
+                key = path.lower()
+                if key not in seen:
+                    results.append((name, path))
+                    seen.add(key)
+    return results
+
+
+def gather_apps() -> List[Tuple[str, str]]:
+    """Aggregate installed applications from various providers."""
+    providers = [
+        gather_registry_apps,
+        gather_shortcuts,
+        gather_steam_games,
+        gather_riot_games,
+        scan_common_folders,
+    ]
+    apps: dict[str, Tuple[str, str]] = {}
+    for prov in providers:
+        try:
+            for name, path in prov():
+                key = path.lower()
+                if key not in apps:
+                    apps[key] = (name, path)
+        except Exception:
+            continue
+    return sorted(apps.values(), key=lambda x: x[0].lower())
+
+
+def choose_app() -> Tuple[str, str]:
+    """Show a list of detected apps and return chosen name and path."""
+    apps = gather_apps()
+    if apps:
         root = tk.Tk()
         root.title("Choose Application")
         lb = tk.Listbox(root, width=50, height=20)
-        for name, _ in shortcuts:
+        for name, _ in apps:
             lb.insert(tk.END, name)
         lb.pack()
         result: Dict[str, str] = {}
@@ -246,7 +442,8 @@ def choose_app() -> str:
         def on_select(event=None):
             sel = lb.curselection()
             if sel:
-                result["name"] = shortcuts[sel[0]][0]
+                result["name"] = apps[sel[0]][0]
+                result["path"] = apps[sel[0]][1]
                 root.destroy()
 
         lb.bind("<Double-Button-1>", on_select)
@@ -254,7 +451,7 @@ def choose_app() -> str:
         root.mainloop()
         if "name" in result:
             print(f"[Main] Selected: {result['name']}")
-            return result["name"]
+            return result["name"], result["path"]
         raise SystemExit("No app chosen")
 
     # Fallback to manual browsing
@@ -267,7 +464,7 @@ def choose_app() -> str:
         raise SystemExit("No file chosen")
     name = get_product_name(path)
     print(f"[Main] Selected file: {path}")
-    return name
+    return name, path
 
 def recognize_app(app_name: str) -> str:
     print(f"[AI] Recognizing app '{app_name}'...")
@@ -560,7 +757,7 @@ class ChatWindow:
 
 def main() -> None:
     print("[Main] Starting Date an App...")
-    app_name = choose_app()
+    app_name, app_path = choose_app()
     app_info = recognize_app(app_name)
     character = create_character(app_name, app_info)
     tags = generate_tags(character)
