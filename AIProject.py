@@ -83,6 +83,43 @@ CATEGORY_KEYS = [
     "unknown",
 ]
 
+# Map various possible key aliases to the canonical names above. The
+# model occasionally drifts and returns singular forms ("expression",
+# "position", "accessory") or other slight variations. Normalizing
+# through this map keeps the rest of the pipeline stable.
+KEY_ALIASES = {
+    "expression": "expressions",
+    "expressions": "expressions",
+    "accessory": "accessories",
+    "accessories": "accessories",
+    "position": "position_sex_position",
+    "position_sex_position": "position_sex_position",
+}
+
+
+def canonicalize_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a new dict with keys mapped to their canonical forms."""
+    normalized: Dict[str, Any] = {}
+    for key, val in data.items():
+        canon = KEY_ALIASES.get(key, key)
+        if canon in normalized:
+            # If both old and new values exist, merge sensibly. This only
+            # really matters for the rare case of hair tags where lists are
+            # expected; other categories will be flattened later.
+            existing = normalized[canon]
+            if isinstance(existing, list):
+                existing_list = existing
+            else:
+                existing_list = [existing]
+            if isinstance(val, list):
+                existing_list.extend(val)
+            else:
+                existing_list.append(val)
+            normalized[canon] = existing_list
+        else:
+            normalized[canon] = val
+    return normalized
+
 EXTRA_TAGS_PATH = os.path.normpath(
     os.getenv(
         "EXTRA_TAGS_PATH",
@@ -230,7 +267,7 @@ def choose_initial_tags(categorized: Dict[str, List[str]]) -> Dict[str, Any]:
             response_format={"type": "json_object"},
         )
         print("[AI Response]", res.choices[0].message.content)
-        choice = json.loads(res.choices[0].message.content)
+        choice = canonicalize_keys(json.loads(res.choices[0].message.content))
     except Exception as e:
         print(f"[Prompt] AI tag selection failed: {e}")
         return {}
@@ -655,7 +692,7 @@ def decide_tag_categories(history: List[Dict[str, str]]) -> List[str]:
         )
     msg = res.choices[0].message
     print("[AI Response]", msg.content)
-    cats = [c for c in safe_json_loads(msg.content).get("categories", []) if c]
+    cats = [KEY_ALIASES.get(c, c) for c in safe_json_loads(msg.content).get("categories", []) if c]
     filtered = [c for c in cats if c in allowed and c.lower() != "nothing"]
     dropped = [c for c in cats if c not in allowed]
     if dropped:
@@ -757,11 +794,12 @@ def choose_expression_position(
         return {}
     msg = res.choices[0].message
     print("[AI Response]", msg.content)
-    data = safe_json_loads(msg.content)
-    exp = data.get("expression")
+    raw = safe_json_loads(msg.content)
+    data = canonicalize_keys({k: v for k, v in raw.items() if k not in {"expression", "position"}})
+    exp = raw.get("expression")
     if exp not in avail_exps:
         exp = random.choice(avail_exps)
-    pos = data.get("position")
+    pos = raw.get("position")
     if pos not in avail_pos:
         pos = random.choice(avail_pos)
     data["expression"] = exp
@@ -801,15 +839,24 @@ def enforce_tag_rules(choice: Dict[str, Any], catalog: Dict[str, List[str]]) -> 
     for key in list(choice.keys()):
         allowed = catalog.get(key, [])
         val = choice[key]
-        if isinstance(val, list):
-            filtered = [t for t in val if t in allowed]
-            if filtered:
-                choice[key] = filtered
+        if key == "hairstyle_hat_head_toppings":
+            if not isinstance(val, list):
+                val = [val] if val in allowed else []
+            else:
+                val = [t for t in val if t in allowed]
+            if val:
+                choice[key] = val
             else:
                 choice.pop(key, None)
+            continue
+        if isinstance(val, list):
+            val = next((t for t in val if t in allowed), None)
+        elif val not in allowed:
+            val = None
+        if val is not None:
+            choice[key] = val
         else:
-            if val not in allowed:
-                choice.pop(key, None)
+            choice.pop(key, None)
 
     # two hairstyle tags
     hair = choice.get("hairstyle_hat_head_toppings", [])
@@ -844,15 +891,18 @@ def enforce_tag_rules(choice: Dict[str, Any], catalog: Dict[str, List[str]]) -> 
             choice["accessories"] = acc[0] if acc else None
 
     # ensure single tags for mandatory categories
-    for key in ["background"]:
+    for key in ["background", "up_clothes", "bottom_clothes", "fullbody_clothes", "accessories"]:
         val = choice.get(key)
         if isinstance(val, list):
             val = val[0] if val else None
-        if not val:
+        if not val and key in {"background"}:
             options = catalog.get(key, [])
             if options:
                 val = random.choice(options)
-        choice[key] = val
+        if val is not None:
+            choice[key] = val
+        else:
+            choice.pop(key, None)
 
 # ---------- simple GUI ----------
 
