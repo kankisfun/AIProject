@@ -38,7 +38,7 @@ client = OpenAI(api_key=TOGETHER_API_KEY, base_url=BASE_URL)
 
 BASE_POSITIVE = "high quality"
 BASE_NEGATIVE = (
-    "low quality, jpeg artifacts, deformed, extra fingers, text, watermark, logo, censored"
+    "NSFW, low quality, jpeg artifacts, deformed, extra fingers, text, watermark, logo, censored"
 )
 
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
@@ -92,13 +92,13 @@ CONV_STATE_INSTRUCTIONS = {
         "Keep it neutral-positive."
     ),
     "flirtish": (
-        "Keep responses short and snapp, Keep it suggestive, be vulgar at a times. NSFW allowed."
+        "Keep responses short and snappy, Keep it suggestive at most."
     ),
     "banter": (
         "Witty and sarcastic, like sparring for fun. Keep it sharp."
     ),
     "conflict": (
-        "Push back hard against disrespect, establish dominance. It's okay not to follow character guidelines. You are allowed and encouraged to swear. NSFW allowed."
+        "Push back hard against disrespect, establish dominance. It's okay not to follow character guidelines. You are allowed and encouraged to swear."
     ),
 }
 
