@@ -71,18 +71,35 @@ def next_run_number(images_dir: Path, prefix: str) -> int:
             max_n = max(max_n, int(m.group(1)))
     return max_n + 1
 
+def log_prompt(title: str, messages: List[Dict[str, str]]) -> None:
+    """Print messages sent to the AI in a readable format."""
+    print(f"\n[Prompt] {title}")
+    for msg in messages:
+        role = msg.get("role", "").capitalize()
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                content = json.dumps(parsed, indent=2)
+            except json.JSONDecodeError:
+                pass
+        print(f"{role}:\n{content}\n")
+
 # ---------- initial setup ----------
 
 def choose_file() -> str:
+    print("[Main] Please choose an application file.")
     root = tk.Tk()
     root.withdraw()
     path = filedialog.askopenfilename()
     root.destroy()
     if not path:
         raise SystemExit("No file chosen")
+    print(f"[Main] Selected file: {path}")
     return os.path.basename(path)
 
 def recognize_app(app_name: str) -> str:
+    print(f"[AI] Recognizing app '{app_name}'...")
     system_msg = "You are an AI app recognizer program."
     user_msg = (
         f"Program: {app_name}\n"
@@ -90,13 +107,15 @@ def recognize_app(app_name: str) -> str:
         "2. What do internet users and memes think about this app?\n"
         "3. What this app icon looks like and what color pallete it uses (what are the leading colors)?"
     )
-    res = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-    )
-    return res.choices[0].message.content.strip()
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    log_prompt("App recognition", messages)
+    res = client.chat.completions.create(model=MODEL, messages=messages)
+    content = res.choices[0].message.content.strip()
+    print(f"[AI] Recognition result:\n{content}")
+    return content
 
 def create_character(app_name: str, app_info: str) -> Dict[str, str]:
+    print("[AI] Creating character description...")
     system_msg = "You design characters based on apps. Respond in JSON."
     user_msg = (
         f"App name: {app_name}\nInfo: {app_info}\n"
@@ -106,13 +125,16 @@ def create_character(app_name: str, app_info: str) -> Dict[str, str]:
         "3. What kind of character could this app have (consider internet users' opinions)\n\n"
         "Return JSON with keys name, sex (male/female), appearance (3 sentences), personality (3 sentences)."
     )
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    log_prompt("Character creation", messages)
     res = client.chat.completions.create(
         model=MODEL,
         temperature=0.7,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        messages=messages,
         response_format={"type": "json_object"},
     )
     data = json.loads(res.choices[0].message.content)
+    print(f"[AI] Character data:\n{json.dumps(data, indent=2)}")
     return {
         "name": data.get("name", "Unknown"),
         "sex": data.get("sex", "female"),
@@ -121,6 +143,7 @@ def create_character(app_name: str, app_info: str) -> Dict[str, str]:
     }
 
 def generate_tags(character: Dict[str, str]) -> Dict[str, str]:
+    print("[AI] Generating character tags...")
     system_msg = (
         "Create simple two-word tags for a character. Respond in JSON with keys:"
         " hair_type, hair_color, body_type, skin, accessories, background, clothes1, clothes2."
@@ -131,17 +154,22 @@ def generate_tags(character: Dict[str, str]) -> Dict[str, str]:
         f"Appearance: {character['appearance']}\n"
         f"Personality: {character['personality']}"
     )
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    log_prompt("Tag generation", messages)
     res = client.chat.completions.create(
         model=MODEL,
         temperature=0.7,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        messages=messages,
         response_format={"type": "json_object"},
     )
-    return json.loads(res.choices[0].message.content)
+    tags = json.loads(res.choices[0].message.content)
+    print(f"[AI] Tags:\n{json.dumps(tags, indent=2)}")
+    return tags
 
 def choose_expression_position(
     prev_exp: str, prev_pos: str, expressions: List[str], positions: List[str]
 ) -> Tuple[str, str]:
+    print("[AI] Choosing new expression and position...")
     avail_exp = [e for e in expressions if e != prev_exp] or expressions
     avail_pos = [p for p in positions if p != prev_pos] or positions
     system_msg = (
@@ -154,18 +182,25 @@ def choose_expression_position(
         "previous_expression": prev_exp,
         "previous_position": prev_pos,
     }
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    log_prompt("Expression/position choice", messages)
     res = client.chat.completions.create(
         model=MODEL,
         temperature=0.7,
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": json.dumps(payload)}],
+        messages=messages,
         response_format={"type": "json_object"},
     )
     data = json.loads(res.choices[0].message.content)
+    print(f"[AI] Chosen expression: {data.get('expression')}, position: {data.get('position')}")
     return data.get("expression", prev_exp), data.get("position", prev_pos)
 
 # ---------- ComfyUI prompt ----------
 
 def assemble_and_send_prompt(sex: str, tags: Dict[str, str], token: str) -> Path | None:
+    print("[ComfyUI] Assembling prompt...")
     parts: List[str] = []
     if tags.get("hair_type"):
         parts.append(f"{tags['hair_type']} hair")
@@ -195,6 +230,9 @@ def assemble_and_send_prompt(sex: str, tags: Dict[str, str], token: str) -> Path
     except Exception as e:
         print(f"[Prompt] Could not load workflow template: {e}")
         return None
+
+    print(f"[ComfyUI] Positive prompt: {positive_text}")
+    print(f"[ComfyUI] Negative prompt: {BASE_NEGATIVE}")
 
     workflow.get("6", {}).setdefault("inputs", {})["text"] = positive_text
     workflow.get("7", {}).setdefault("inputs", {})["text"] = BASE_NEGATIVE
@@ -287,9 +325,15 @@ class ChatWindow:
         self.initial_message()
 
     def initial_message(self) -> None:
-        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": "Introduce yourself."}]
+        print("[Chat] Sending initial message to AI...")
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": "Introduce yourself."},
+        ]
+        log_prompt("Initial chat", messages)
         res = client.chat.completions.create(model=MODEL, messages=messages)
         line = res.choices[0].message.content.strip()
+        print(f"[AI] Initial reply:\n{line}")
         self.history.append({"role": "assistant", "content": line})
         self.ai_label.config(text=f"{self.character['name']}: {line}")
         self.update_image()
@@ -325,8 +369,10 @@ class ChatWindow:
         self.history.append({"role": "user", "content": user_text})
         msgs = [{"role": "system", "content": self.system_prompt}]
         msgs.extend(recent_messages(self.history))
+        log_prompt("Chat", msgs)
         res = client.chat.completions.create(model=MODEL, messages=msgs)
         reply = res.choices[0].message.content.strip()
+        print(f"[AI] Reply:\n{reply}")
         self.history.append({"role": "assistant", "content": reply})
         self.ai_label.config(text=f"{self.character['name']}: {reply}")
         self.update_image()
@@ -337,10 +383,12 @@ class ChatWindow:
 # ---------- main ----------
 
 def main() -> None:
+    print("[Main] Starting Date an App...")
     app_name = choose_file()
     app_info = recognize_app(app_name)
     character = create_character(app_name, app_info)
     tags = generate_tags(character)
+    print("[Main] Launching chat window.")
     ChatWindow(app_name, character, tags).run()
 
 if __name__ == "__main__":
