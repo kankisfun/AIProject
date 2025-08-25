@@ -274,7 +274,16 @@ def gather_registry_apps() -> List[Tuple[str, str]]:
 
 
 def gather_shortcuts() -> List[Tuple[str, str]]:
-    """Collect .lnk files from Desktop and Start Menu."""
+    """Collect .lnk files from Desktop and Start Menu.
+
+    Microsoft Store applications often use generic executables such as
+    ``explorer.exe`` as the shortcut target.  When we deduplicate based solely
+    on that target path, distinct apps (e.g. Spotify, Netflix) collapse into a
+    single entry and thus fail to appear in the list.  Here we instead dedupe by
+    the shortcut's name and fall back to that name if product metadata resolves
+    to a generic system executable.
+    """
+
     locations = []
     user = os.environ.get("USERPROFILE", "")
     public = os.environ.get("PUBLIC", "")
@@ -285,16 +294,22 @@ def gather_shortcuts() -> List[Tuple[str, str]]:
         locations.append(Path(public) / "Desktop")
     if appdata:
         locations.append(Path(appdata) / r"Microsoft\Windows\Start Menu\Programs")
+
     entries: List[Tuple[str, str]] = []
     seen: set[str] = set()
     for loc in locations:
         if loc.exists():
             for p in loc.rglob("*.lnk"):
                 target = resolve_shortcut(str(p))
-                if target in seen:
-                    continue
-                seen.add(target)
                 name = get_product_name(str(p))
+                # Many store apps resolve to explorer.exe/cmd.exe; use the
+                # shortcut file name instead in such cases.
+                if not name or Path(target).name.lower() in {"explorer.exe", "cmd.exe"}:
+                    name = p.stem
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
                 entries.append((name, target))
     return sorted(entries, key=lambda x: x[0].lower())
 
@@ -415,11 +430,15 @@ def gather_apps() -> List[Tuple[str, str]]:
         gather_riot_games,
         scan_common_folders,
     ]
+    # Deduplicate by application name rather than path.  Some providers (notably
+    # Microsoft Store shortcuts) may point multiple apps to the same executable
+    # such as ``explorer.exe``.  Using the path as the key would therefore drop
+    # many distinct entries.
     apps: dict[str, Tuple[str, str]] = {}
     for prov in providers:
         try:
             for name, path in prov():
-                key = path.lower()
+                key = name.lower()
                 if key not in apps:
                     apps[key] = (name, path)
         except Exception:
@@ -567,7 +586,9 @@ def choose_expression_position(
 
 # ---------- ComfyUI prompt ----------
 
-def assemble_and_send_prompt(sex: str, tags: Dict[str, str], token: str) -> Path | None:
+def assemble_and_send_prompt(
+    sex: str, tags: Dict[str, str], token: str, app_name: str
+) -> Path | None:
     print("[ComfyUI] Assembling prompt...")
     parts: List[str] = []
     if tags.get("hair_type"):
@@ -590,6 +611,8 @@ def assemble_and_send_prompt(sex: str, tags: Dict[str, str], token: str) -> Path
         parts.append(tags["clothes1"])
     if tags.get("clothes2"):
         parts.append(tags["clothes2"])
+    if app_name:
+        parts.append(f"clothes with {app_name} logo")
     positive_text = BASE_POSITIVE + f", 1{sex}" + (", " + ", ".join(parts) if parts else "")
 
     try:
@@ -727,7 +750,9 @@ class ChatWindow:
         tags = dict(self.base_tags)
         tags["expression"] = self.expression
         tags["position"] = self.position
-        img_path = assemble_and_send_prompt(self.character["sex"], tags, self.token)
+        img_path = assemble_and_send_prompt(
+            self.character["sex"], tags, self.token, self.app_name
+        )
         if img_path:
             self.show_image(img_path)
 
